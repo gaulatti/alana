@@ -1,6 +1,6 @@
 {
-  "current_scene": "Earthquakes",
-  "current_program_scene": "Earthquakes",
+  "current_scene": "Monitor",
+  "current_program_scene": "Monitor",
   "scene_order": [
     {
       "name": "Monitor"
