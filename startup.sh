@@ -1,14 +1,17 @@
 #!/bin/bash
 
-# Setup OBS scenes and configuration
-/usr/local/bin/setup-scenes.sh
-
 # 1. Create a stable startup file: Launch TWM, a persistent terminal, AND OBS
 echo "#!/bin/sh" > /tmp/obs-xstartup
 echo "export QT_QPA_PLATFORM=xcb" >> /tmp/obs-xstartup
+echo "export HOME=/config" >> /tmp/obs-xstartup
 
 # Launch TWM (Window Manager) in the background
 echo "twm &" >> /tmp/obs-xstartup
+
+# Wait for X server to be ready, then setup OBS configuration
+echo "sleep 3" >> /tmp/obs-xstartup
+echo "/usr/local/bin/setup-scenes.sh &" >> /tmp/obs-xstartup
+echo "sleep 2" >> /tmp/obs-xstartup
 
 # Launch OBS using dbus-launch in the background
 echo "dbus-launch obs --startstreaming --verbose --disable-shutdown-check &" >> /tmp/obs-xstartup  # <-- Launches OBS automatically
