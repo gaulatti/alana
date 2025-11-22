@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# Setup OBS scenes and configuration
+/usr/local/bin/setup-scenes.sh
+
 # 1. Create a stable startup file: Launch TWM, a persistent terminal, AND OBS
 echo "#!/bin/sh" > /tmp/obs-xstartup
 echo "export QT_QPA_PLATFORM=xcb" >> /tmp/obs-xstartup

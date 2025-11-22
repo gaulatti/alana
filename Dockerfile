@@ -83,7 +83,10 @@ RUN apt-get update && \
 
 # Add startup script and necessary configs
 COPY startup.sh /usr/local/bin/
+COPY setup-scenes.sh /usr/local/bin/
+COPY scenes.json /tmp/
 RUN chmod +x /usr/local/bin/startup.sh
+RUN chmod +x /usr/local/bin/setup-scenes.sh
 
 # Expose ports for WebSocket API (4455) and VNC (5901)
 EXPOSE 4455 5901
