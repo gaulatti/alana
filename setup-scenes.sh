@@ -11,6 +11,12 @@ echo "Copying scene collection..."
 # Copy scene collection
 cp /tmp/scenes.json /config/.config/obs-studio/basic/scenes/Untitled.json
 
+# Create Advanced Scene Switcher directory and copy config BEFORE OBS starts
+mkdir -p /config/.config/obs-studio/plugin_config/advanced-scene-switcher
+cp /tmp/advanced-scene-switcher.json /config/.config/obs-studio/plugin_config/advanced-scene-switcher/advanced-scene-switcher.json
+chmod 644 /config/.config/obs-studio/plugin_config/advanced-scene-switcher/advanced-scene-switcher.json
+echo "Advanced Scene Switcher config prepared"
+
 echo "Creating basic.ini..."
 
 # Create basic.ini to set the default scene collection and profile
@@ -55,6 +61,9 @@ RecAudioEncoder=aac
 RecTracks=1
 StreamEncoder=x264
 RecEncoder=x264
+x264Profile=high
+x264Tune=none
+x264Options=bframes=2:ref=3:subme=7:me_range=16:qcomp=0.60:keyint=250:min-keyint=25
 
 [Video]
 BaseCX=1920
@@ -66,10 +75,10 @@ FPSCommon=60
 FPSInt=30
 FPSNum=30
 FPSDen=1
-ScaleType=bicubic
+ScaleType=lanczos
 ColorFormat=NV12
 ColorSpace=709
-ColorRange=Partial
+ColorRange=Full
 SdrWhiteLevel=300
 HdrNominalPeakLevel=1000
 
@@ -134,10 +143,11 @@ Pre24.1Defaults=false
 MaxLogs=10
 InfoIncrement=1
 ProcessPriority=Normal
-EnableAutoUpdates=true
+EnableAutoUpdates=false
 ConfirmOnExit=true
 HotkeyFocusType=NeverDisableHotkeys
 YtDockCleanupDone=true
+LastVersion=503447555
 
 [BasicWindow]
 geometry=@ByteArray(\x1\xd9\xd0\xcb\0\x3\0\0\0\0\0\0\0\0\0\0\0\0\a\x7f\0\0\x4\x37\0\0\0\0\0\0\0\0\0\0\a\x7f\0\0\x4\x37\0\0\0\0\0\0\0\0\a\x80\0\0\0\0\0\0\0\0\0\0\a\x7f\0\0\x4\x37)
@@ -201,6 +211,13 @@ EOF
 # Skip auto-config wizard
 mkdir -p /config/.config/obs-studio/plugin_config/obs-browser/obs_profile_cookies
 cat > /config/.config/obs-studio/plugin_config/obs-browser/obs_profile_cookies/Cookies << 'EOF'
+EOF
+
+# Disable What's New dialog by creating window-state.json
+cat > /config/.config/obs-studio/basic/profiles/Untitled/window-state.json << 'EOF'
+{
+    "WhatsNewInfoLastVersion": 503447555
+}
 EOF
 
 echo "OBS configuration setup complete!"

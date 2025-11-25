@@ -1,5 +1,5 @@
 # Use a single, reliable base image
-FROM ubuntu:22.04
+FROM ubuntu:24.04
 
 # Set environment variables
 ENV DEBIAN_FRONTEND=noninteractive
@@ -29,7 +29,7 @@ RUN apt-get update && \
     # Core Qt and Media dependencies
     libmfx1 \                       
     libqt6widgets6 libqt6gui6 libqt6core6 libqt6webenginecore6 libqt6webenginewidgets6 \
-    libasound2 \
+    libasound2t64 \
     pulseaudio \
     libnss3 \                   
     # CRITICAL XCB dependencies for Qt GUI:
@@ -49,8 +49,7 @@ RUN apt-get update && \
     fonts-noto-cjk \                
     fontconfig \                    
     xfonts-base \                   
-    libgl1-mesa-glx \               
-    libegl1-mesa \                  
+    libegl1 \                  
     libxkbcommon-x11-0 \            
     # Cleanup
     xterm \
@@ -81,15 +80,23 @@ RUN apt-get update && \
     rm /tmp/media-playlist-source.deb && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
+# 5. Install Advanced Scene Switcher Plugin
+RUN wget https://github.com/WarmUpTill/SceneSwitcher/releases/download/1.32.3/advanced-scene-switcher-1.32.3-x86_64-linux-gnu.deb -O /tmp/advanced-scene-switcher.deb && \
+    dpkg -i /tmp/advanced-scene-switcher.deb && \
+    apt-get install -fy && \
+    rm /tmp/advanced-scene-switcher.deb && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
 # Add startup script and necessary configs
 COPY startup.sh /usr/local/bin/
 COPY setup-scenes.sh /usr/local/bin/
 COPY scenes.json /tmp/
+COPY advanced-scene-switcher.json /tmp/
 RUN chmod +x /usr/local/bin/startup.sh
 RUN chmod +x /usr/local/bin/setup-scenes.sh
 
 # Expose ports for WebSocket API (4455) and VNC (5901)
-EXPOSE 4455 5901
+EXPOSE 4455 5901 9222
 
 # Set the entrypoint to the startup script
 ENTRYPOINT ["/usr/local/bin/startup.sh"]
