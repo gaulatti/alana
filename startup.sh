@@ -1,10 +1,24 @@
 #!/bin/bash
 
+# Set up GPU device permissions
+if [ -e /dev/dri/card0 ]; then
+    chmod 666 /dev/dri/card0
+fi
+
+if [ -e /dev/dri/renderD129 ]; then
+    RENDER_GID=$(stat -c '%g' /dev/dri/renderD129)
+    groupadd -g $RENDER_GID render 2>/dev/null || true
+    usermod -a -G $RENDER_GID root 2>/dev/null || true
+fi
+
 # 1. Create a stable startup file: Launch TWM, a persistent terminal, AND OBS
 echo "#!/bin/sh" > /tmp/obs-xstartup
 echo "export QT_QPA_PLATFORM=xcb" >> /tmp/obs-xstartup
 echo "export HOME=/config" >> /tmp/obs-xstartup
 echo "export CEF_REMOTE_DEBUGGING_PORT=9222" >> /tmp/obs-xstartup
+echo "export LIBVA_DRIVER_NAME=iHD" >> /tmp/obs-xstartup
+echo "export LIBVA_DRIVERS_PATH=/usr/lib/x86_64-linux-gnu/dri" >> /tmp/obs-xstartup
+echo "export LIBVA_MESSAGING_LEVEL=2" >> /tmp/obs-xstartup
 
 # Create TWM config to place windows at 0,0 without interaction
 cat > /tmp/.twmrc << 'TWMRC'

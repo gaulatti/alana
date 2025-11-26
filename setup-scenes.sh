@@ -25,7 +25,7 @@ cat > /config/.config/obs-studio/basic/profiles/Untitled/basic.ini << EOF
 Name=Untitled
 
 [Output]
-Mode=Simple
+Mode=Advanced
 FilenameFormatting=%CCYY-%MM-%DD %hh-%mm-%ss
 DelayEnable=false
 DelaySec=20
@@ -49,8 +49,8 @@ FilePath=/config
 RecFormat2=mkv
 VBitrate=8750
 ABitrate=160
-Preset=veryfast
-NVENCPreset2=p5
+UseAdvanced=true
+QSVPreset=balanced
 RecQuality=Stream
 RecRB=false
 RecRBTime=20
@@ -59,11 +59,10 @@ RecRBPrefix=Replay
 StreamAudioEncoder=aac
 RecAudioEncoder=aac
 RecTracks=1
-StreamEncoder=x264
-RecEncoder=x264
-x264Profile=high
-x264Tune=none
-x264Options=bframes=2:ref=3:subme=7:me_range=16:qcomp=0.60:keyint=250:min-keyint=25
+StreamEncoder=obs_qsv11_v2
+RecEncoder=obs_qsv11_v2
+UseAdvanced=true
+QSVPreset=balanced
 
 [Video]
 BaseCX=1920
@@ -91,16 +90,14 @@ MeterDecayRate=23.53
 PeakMeterType=0
 
 [AdvOut]
-RecEncoder=obs_x264
+RecEncoder=obs_qsv11_v2
 RecType=Standard
 RecFormat=mkv
-RecQuality=Stream
-RecFormat2=mkv
 ApplyServiceSettings=true
 UseRescale=false
 TrackIndex=1
 VodTrackIndex=2
-Encoder=obs_x264
+Encoder=obs_qsv11_v2
 RecFilePath=/config
 RecUseRescale=false
 RecTracks=1
