@@ -43,6 +43,10 @@ RUN apt-get update && \
     i965-va-driver \
     mesa-va-drivers \
     va-driver-all \
+    vainfo \
+    intel-gpu-tools \
+    # Additional dependencies for newer intel-media-driver
+    libigdgmm12 \
     # Core graphics and Font dependencies for stable Browser Source rendering:
     libx11-6 libgl1 libxrandr2 \
     fonts-noto-core \               
@@ -62,9 +66,12 @@ RUN apt-get update && \
 # Using the stable Launchpad PPA path via add-apt-repository
 RUN add-apt-repository ppa:obsproject/obs-studio -y
 
+# 2.5. Add Intel Graphics PPA for newer intel-media-driver
+RUN add-apt-repository ppa:oibaf/graphics-drivers -y
+
 # 3. Final OBS Installation
 RUN apt-get update \
-    && apt-get install -y obs-studio \
+    && apt-get install -y obs-studio intel-media-va-driver-non-free \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 

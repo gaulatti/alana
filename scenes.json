@@ -467,6 +467,26 @@
             "value": "/media/7.mp3",
             "selected": false,
             "hidden": false
+          },
+          {
+            "value": "/media/8.mp3",
+            "selected": false,
+            "hidden": false
+          },
+          {
+            "value": "/media/9.mp3",
+            "selected": false,
+            "hidden": false
+          },
+          {
+            "value": "/media/10.mp3",
+            "selected": false,
+            "hidden": false
+          },
+          {
+            "value": "/media/11.mp3",
+            "selected": false,
+            "hidden": false
           }
         ],
         "shuffle": true,
