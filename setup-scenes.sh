@@ -8,14 +8,8 @@ mkdir -p /config/.config/obs-studio/basic/scenes
 mkdir -p /config/.config/obs-studio/basic/profiles/Untitled
 
 echo "Copying scene collection..."
-# Copy scene collection
+# Copy scene collection with embedded Advanced Scene Switcher configuration
 cp /tmp/scenes.json /config/.config/obs-studio/basic/scenes/Untitled.json
-
-# Create Advanced Scene Switcher directory and copy config BEFORE OBS starts
-mkdir -p /config/.config/obs-studio/plugin_config/advanced-scene-switcher
-cp /tmp/advanced-scene-switcher.json /config/.config/obs-studio/plugin_config/advanced-scene-switcher/advanced-scene-switcher.json
-chmod 644 /config/.config/obs-studio/plugin_config/advanced-scene-switcher/advanced-scene-switcher.json
-echo "Advanced Scene Switcher config prepared"
 
 echo "Creating basic.ini..."
 

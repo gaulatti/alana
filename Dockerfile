@@ -98,7 +98,6 @@ RUN wget https://github.com/WarmUpTill/SceneSwitcher/releases/download/1.32.3/ad
 COPY startup.sh /usr/local/bin/
 COPY setup-scenes.sh /usr/local/bin/
 COPY scenes.json /tmp/
-COPY advanced-scene-switcher.json /tmp/
 RUN chmod +x /usr/local/bin/startup.sh
 RUN chmod +x /usr/local/bin/setup-scenes.sh
 
