@@ -198,8 +198,9 @@ async function main() {
         const sceneName = 'AudioDemo';
         const audioSource = 'DemoAudio';
 
-        // Note: This example assumes you have a media file at /media/demo.mp3
-        // Modify the path as needed or skip this section if no media is available
+        // Note: This demo creates a visual scene to demonstrate scene creation.
+        // To test audio/media control, you would need to add media files to /media
+        // and create a media source pointing to them.
         
         try {
             // Check if we can create the demo
@@ -218,12 +219,13 @@ async function main() {
                 }
             });
 
-            console.log('\nTo test audio control, add a media file and update the script.');
-            console.log('Example usage:');
-            console.log('  await createAudioSource("AudioDemo", "Music", "/media/song.mp3", { looping: true });');
-            console.log('  await controlMedia("Music", "play");');
-            console.log('  await setVolume("Music", 50);');
-            console.log('  await toggleMute("Music");');
+            console.log('\nTo test audio control with actual media files:');
+            console.log('1. Mount a directory with media files to /media in the container');
+            console.log('2. Use the following code:');
+            console.log('   await createAudioSource("AudioDemo", "Music", "/media/your-song.mp3", { looping: true });');
+            console.log('   await controlMedia("Music", "play");');
+            console.log('   await setVolume("Music", 50);');
+            console.log('   await toggleMute("Music");');
 
             // Clean up
             await new Promise(r => setTimeout(r, 2000));

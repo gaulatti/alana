@@ -151,6 +151,8 @@ if [ -n "${OBS_WS_PASSWORD}" ]; then
     "server_password": "${OBS_WS_PASSWORD}"
 }
 EOF
+    # Set restrictive permissions on config file containing password
+    chmod 600 /config/.config/obs-studio/plugin_config/obs-websocket/config.json
     echo "obs-websocket configured with authentication."
 else
     # Without authentication (for development/testing only)
@@ -163,8 +165,14 @@ else
     "server_password": ""
 }
 EOF
-    echo "WARNING: obs-websocket configured WITHOUT authentication."
-    echo "Set OBS_WEBSOCKET_PASSWORD for production use."
+    echo "=============================================="
+    echo "SECURITY WARNING: obs-websocket is configured"
+    echo "WITHOUT authentication. This is insecure and"
+    echo "should only be used for local development."
+    echo ""
+    echo "For production, set OBS_WEBSOCKET_PASSWORD:"
+    echo "  export OBS_WEBSOCKET_PASSWORD=\"your_secure_password\""
+    echo "=============================================="
 fi
 
 echo "Creating basic.ini..."

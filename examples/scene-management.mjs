@@ -158,7 +158,8 @@ async function deleteScene(sceneName) {
                 await obs.call('RemoveInput', { inputName: item.sourceName });
                 console.log(`Removed input: ${item.sourceName}`);
             } catch (error) {
-                // Input might be used by other scenes, ignore
+                // Input might be used by other scenes or is a scene reference
+                console.log(`Skipped removing input: ${item.sourceName} (may be in use elsewhere)`);
             }
         }
 
