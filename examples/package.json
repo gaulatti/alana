@@ -1,0 +1,14 @@
+{
+  "name": "alana-obs-websocket-examples",
+  "version": "1.0.0",
+  "description": "Example scripts for obs-websocket API",
+  "type": "module",
+  "scripts": {
+    "basic": "node basic-operations.mjs",
+    "scenes": "node scene-management.mjs",
+    "media": "node media-control.mjs"
+  },
+  "dependencies": {
+    "obs-websocket-js": "^5.0.5"
+  }
+}

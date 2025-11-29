@@ -6,10 +6,166 @@ echo "Setting up OBS configuration..."
 # Create OBS config directories
 mkdir -p /config/.config/obs-studio/basic/scenes
 mkdir -p /config/.config/obs-studio/basic/profiles/Untitled
+mkdir -p /config/.config/obs-studio/plugin_config/obs-websocket
 
-echo "Copying scene collection..."
-# Copy scene collection with embedded Advanced Scene Switcher configuration
-cp /tmp/scenes.json /config/.config/obs-studio/basic/scenes/Untitled.json
+# Check if legacy mode is enabled
+if [ "${OBS_LEGACY_MODE}" = "true" ]; then
+    echo "=============================================="
+    echo "WARNING: Legacy mode enabled (DEPRECATED)"
+    echo "Static scene import is deprecated and will be"
+    echo "removed in a future release."
+    echo "Please migrate to obs-websocket API for"
+    echo "dynamic scene/source/media control."
+    echo "=============================================="
+    
+    echo "Copying scene collection..."
+    # Copy scene collection with embedded Advanced Scene Switcher configuration
+    cp /tmp/scenes.json /config/.config/obs-studio/basic/scenes/Untitled.json
+    
+    # Copy advanced scene switcher config if available (for standalone import)
+    if [ -f /tmp/advanced-scene-switcher.json ]; then
+        echo "Copying Advanced Scene Switcher configuration..."
+        mkdir -p /config/.config/obs-studio/plugin_config/advanced-scene-switcher
+        cp /tmp/advanced-scene-switcher.json /config/.config/obs-studio/plugin_config/advanced-scene-switcher/settings.json
+    fi
+else
+    echo "Dynamic mode enabled (recommended)"
+    echo "OBS will start with a minimal scene collection."
+    echo "All scene/source/transition/media operations should"
+    echo "be managed via obs-websocket API on port ${OBS_WEBSOCKET_PORT:-4455}."
+    
+    # Create minimal scene collection with a single blank scene
+    cat > /config/.config/obs-studio/basic/scenes/Untitled.json << 'SCENES_EOF'
+{
+  "current_scene": "Scene",
+  "current_program_scene": "Scene",
+  "scene_order": [
+    {
+      "name": "Scene"
+    }
+  ],
+  "name": "Untitled",
+  "groups": [],
+  "quick_transitions": [
+    {
+      "name": "Cut",
+      "duration": 300,
+      "hotkeys": [],
+      "id": 1,
+      "fade_to_black": false
+    },
+    {
+      "name": "Fade",
+      "duration": 300,
+      "hotkeys": [],
+      "id": 2,
+      "fade_to_black": false
+    }
+  ],
+  "transitions": [],
+  "saved_projectors": [],
+  "current_transition": "Cut",
+  "transition_duration": 300,
+  "preview_locked": false,
+  "scaling_enabled": false,
+  "scaling_level": 0,
+  "scaling_off_x": 0.0,
+  "scaling_off_y": 0.0,
+  "modules": {
+    "auto-scene-switcher": {
+      "interval": 300,
+      "non_matching_scene": "",
+      "switch_if_not_matching": false,
+      "active": false,
+      "switches": []
+    },
+    "output-timer": {
+      "streamTimerHours": 0,
+      "streamTimerMinutes": 0,
+      "streamTimerSeconds": 30,
+      "recordTimerHours": 0,
+      "recordTimerMinutes": 0,
+      "recordTimerSeconds": 30,
+      "autoStartStreamTimer": false,
+      "autoStartRecordTimer": false,
+      "pauseRecordTimer": true
+    },
+    "scripts-tool": []
+  },
+  "resolution": {
+    "x": 1920,
+    "y": 1080
+  },
+  "sources": [
+    {
+      "prev_ver": 503447555,
+      "name": "Scene",
+      "uuid": "00000000-0000-0000-0000-000000000001",
+      "id": "scene",
+      "versioned_id": "scene",
+      "settings": {
+        "id_counter": 0,
+        "custom_size": false,
+        "items": []
+      },
+      "mixers": 0,
+      "sync": 0,
+      "flags": 0,
+      "volume": 1.0,
+      "balance": 0.5,
+      "enabled": true,
+      "muted": false,
+      "push-to-mute": false,
+      "push-to-mute-delay": 0,
+      "push-to-talk": false,
+      "push-to-talk-delay": 0,
+      "hotkeys": {
+        "OBSBasic.SelectScene": []
+      },
+      "deinterlace_mode": 0,
+      "deinterlace_field_order": 0,
+      "monitoring_type": 0,
+      "private_settings": {}
+    }
+  ]
+}
+SCENES_EOF
+fi
+
+# Configure obs-websocket settings
+OBS_WS_PORT="${OBS_WEBSOCKET_PORT:-4455}"
+OBS_WS_PASSWORD="${OBS_WEBSOCKET_PASSWORD:-}"
+
+echo "Configuring obs-websocket on port ${OBS_WS_PORT}..."
+
+# Create obs-websocket configuration
+# OBS 28+ uses a JSON config file for websocket settings
+if [ -n "${OBS_WS_PASSWORD}" ]; then
+    # With authentication enabled
+    cat > /config/.config/obs-studio/plugin_config/obs-websocket/config.json << EOF
+{
+    "server_enabled": true,
+    "server_port": ${OBS_WS_PORT},
+    "alerts_enabled": false,
+    "auth_required": true,
+    "server_password": "${OBS_WS_PASSWORD}"
+}
+EOF
+    echo "obs-websocket configured with authentication."
+else
+    # Without authentication (for development/testing only)
+    cat > /config/.config/obs-studio/plugin_config/obs-websocket/config.json << EOF
+{
+    "server_enabled": true,
+    "server_port": ${OBS_WS_PORT},
+    "alerts_enabled": false,
+    "auth_required": false,
+    "server_password": ""
+}
+EOF
+    echo "WARNING: obs-websocket configured WITHOUT authentication."
+    echo "Set OBS_WEBSOCKET_PASSWORD for production use."
+fi
 
 echo "Creating basic.ini..."
 
