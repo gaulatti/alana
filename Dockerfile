@@ -4,6 +4,11 @@ FROM ubuntu:24.04
 # Set environment variables
 ENV DEBIAN_FRONTEND=noninteractive
 ENV HOME=/config
+# obs-websocket configuration (OBS 28+ has obs-websocket built-in)
+ENV OBS_WEBSOCKET_PASSWORD=""
+ENV OBS_WEBSOCKET_PORT=4455
+# Legacy mode: set to "true" to enable static scene import (deprecated)
+ENV OBS_LEGACY_MODE="false"
 WORKDIR /config
 
 # 1. Install core dependencies, VNC, X, QSV, and rendering fixes
@@ -97,11 +102,18 @@ RUN wget https://github.com/WarmUpTill/SceneSwitcher/releases/download/1.32.3/ad
 # Add startup script and necessary configs
 COPY startup.sh /usr/local/bin/
 COPY setup-scenes.sh /usr/local/bin/
+# DEPRECATED: scenes.json and advanced-scene-switcher.json are kept for legacy support
+# Use OBS_LEGACY_MODE=true to enable static scene import (not recommended)
+# All scene/source/transition/media operations should be managed via obs-websocket API
 COPY scenes.json /tmp/
+COPY advanced-scene-switcher.json /tmp/
 RUN chmod +x /usr/local/bin/startup.sh
 RUN chmod +x /usr/local/bin/setup-scenes.sh
 
 # Expose ports for WebSocket API (4455) and VNC (5901)
+# Port 4455: obs-websocket (built-in with OBS 28+) for remote control
+# Port 5901: VNC for graphical access
+# Port 9222: CEF remote debugging
 EXPOSE 4455 5901 9222
 
 # Set the entrypoint to the startup script
