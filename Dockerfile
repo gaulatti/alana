@@ -9,6 +9,7 @@ ENV OBS_WEBSOCKET_PASSWORD=""
 ENV OBS_WEBSOCKET_PORT=4455
 # Legacy mode: set to "true" to enable static scene import (deprecated)
 ENV OBS_LEGACY_MODE="false"
+ENV CHANNEL_BROWSER="chrome"
 WORKDIR /config
 
 # 1. Install core dependencies, VNC, X, QSV, and rendering fixes
@@ -18,6 +19,7 @@ RUN apt-get update && \
     software-properties-common \
     gnupg \
     dirmngr \
+    ca-certificates \
     curl \
     wget \
     # VNC and X Server
@@ -28,6 +30,8 @@ RUN apt-get update && \
     x11vnc \
     websockify \
     twm \
+    wmctrl \
+    xdotool \
     xinit \
     dbus \
     dbus-x11 \
@@ -41,6 +45,8 @@ RUN apt-get update && \
     libxcb-randr0 \
     libxcb-image0 \
     libxcb-icccm4 \
+    # Standalone browser fallback for headless capture
+    epiphany-browser \
     # FFMPEG and QSV runtime dependencies
     ffmpeg \
     libva-dev \
@@ -60,6 +66,27 @@ RUN apt-get update && \
     xfonts-base \                   
     libegl1 \                  
     libxkbcommon-x11-0 \            
+    # CEF (Chromium Embedded Framework) runtime deps for obs-browser:
+    libgbm1 \
+    libdrm2 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxext6 \
+    libxrandr2 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libatspi2.0-0 \
+    libcups2 \
+    libpango-1.0-0 \
+    libpangocairo-1.0-0 \
+    libcairo2 \
+    libcairo-gobject2 \
+    libgdk-pixbuf-2.0-0 \
+    libgtk-3-0 \
+    libnspr4 \
+    libnss3 \
+    \
     # Cleanup
     xterm \
     xserver-xorg-core \
@@ -67,16 +94,27 @@ RUN apt-get update && \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. Add OBS PPA and Install OBS Studio
-# Using the stable Launchpad PPA path via add-apt-repository
-RUN add-apt-repository ppa:obsproject/obs-studio -y
+# 2. Add PPAs: Intel graphics drivers + OBS official (required for full obs-browser/CEF).
+# Ubuntu 24.04 universe ships obs-studio 30.0.2+dfsg which strips CEF for DFSG compliance.
+# The OBS PPA ships the complete package with CEF bundled — Browser source requires this.
+RUN add-apt-repository ppa:oibaf/graphics-drivers -y && \
+    add-apt-repository ppa:obsproject/obs-studio -y
 
-# 2.5. Add Intel Graphics PPA for newer intel-media-driver
-RUN add-apt-repository ppa:oibaf/graphics-drivers -y
-
-# 3. Final OBS Installation
+# 3. Install OBS Studio from OBS official PPA (includes obs-browser + CEF)
 RUN apt-get update \
-    && apt-get install -y obs-studio intel-media-va-driver-non-free \
+    && apt-get install -y \
+    obs-studio \
+    intel-media-va-driver-non-free \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# 3b. Install a standalone browser for the captured channel display.
+# Google Chrome is used instead of Ubuntu's snap-backed browsers so it works
+# as a normal X11 app inside this container.
+RUN apt-get update \
+    && wget -O /tmp/google-chrome-stable_current_amd64.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+    && apt-get install -y /tmp/google-chrome-stable_current_amd64.deb \
+    && rm -f /tmp/google-chrome-stable_current_amd64.deb \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -93,8 +131,10 @@ RUN apt-get update && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # 5. Install Advanced Scene Switcher Plugin
-RUN wget https://github.com/WarmUpTill/SceneSwitcher/releases/download/1.32.3/advanced-scene-switcher-1.32.3-x86_64-linux-gnu.deb -O /tmp/advanced-scene-switcher.deb && \
-    dpkg -i /tmp/advanced-scene-switcher.deb && \
+# 1.31.0: min OBS 30.1.2, no canvas API dependency — compatible with OBS 31.x/32.x from PPA.
+RUN wget https://github.com/WarmUpTill/SceneSwitcher/releases/download/1.31.0/advanced-scene-switcher-1.31.0-x86_64-linux-gnu.deb -O /tmp/advanced-scene-switcher.deb && \
+    dpkg -i /tmp/advanced-scene-switcher.deb || true && \
+    apt-get update && \
     apt-get install -fy && \
     rm /tmp/advanced-scene-switcher.deb && \
     apt-get clean && rm -rf /var/lib/apt/lists/*

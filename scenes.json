@@ -1,15 +1,9 @@
 {
-  "current_scene": "Monitor",
-  "current_program_scene": "Monitor",
+  "current_scene": "Main",
+  "current_program_scene": "Main",
   "scene_order": [
     {
-      "name": "Monitor"
-    },
-    {
-      "name": "Events"
-    },
-    {
-      "name": "Earthquakes"
+      "name": "Main"
     }
   ],
   "name": "Untitled",
@@ -28,13 +22,6 @@
       "hotkeys": [],
       "id": 2,
       "fade_to_black": false
-    },
-    {
-      "name": "Fade",
-      "duration": 300,
-      "hotkeys": [],
-      "id": 3,
-      "fade_to_black": true
     }
   ],
   "transitions": [
@@ -82,334 +69,7 @@
       "autoStartRecordTimer": false,
       "pauseRecordTimer": true
     },
-    "scripts-tool": [],
-    "advanced-scene-switcher": {
-      "sceneGroups": [],
-      "macros": [
-        {
-          "name": "Monitor-Events",
-          "group": false,
-          "pauseSaveBehavior": 0,
-          "pause": false,
-          "parallel": false,
-          "checkConditionsInParallel": false,
-          "onChange": true,
-          "skipExecOnStart": false,
-          "stopActionsIfNotDone": false,
-          "useShortCircuitEvaluation": false,
-          "useCustomConditionCheckInterval": false,
-          "customConditionCheckInterval": { "value": { "value": 0.29999999999999999, "type": 0 }, "unit": 0, "version": 1 },
-          "dockSettings": {
-            "register": false,
-            "standaloneDock": true,
-            "dockWindow": "Dock",
-            "hasRunButton": true,
-            "hasPauseButton": true,
-            "hasStatusLabel": false,
-            "highlightIfConditionsTrue": false,
-            "runButtonText": "Run",
-            "pauseButtonText": "Pause",
-            "unpauseButtonText": "Unpause",
-            "conditionsTrueStatusText": "Conditions are true.",
-            "conditionsFalseStatusText": "Conditions are false.",
-            "dockId": "advss-macro-dock-c6c3241f-c19b-4643-bb32-b17dca375799",
-            "version": 1
-          },
-          "macroActionConditionSplitterPosition": [{ "pos": 192 }, { "pos": 191 }],
-          "macroElseActionSplitterPosition": [{ "pos": 159 }, { "pos": 0 }],
-          "registerHotkeys": false,
-          "pauseHotkey": [],
-          "unpauseHotkey": [],
-          "togglePauseHotkey": [],
-          "conditions": [
-            {
-              "segmentSettings": { "collapsed": false, "useCustomLabel": false, "customLabel": "My label", "enabled": true, "version": 1 },
-              "id": "scene",
-              "logic": 0,
-              "durationModifier": { "time_constraint": 2, "seconds": { "value": { "value": 60.0, "type": 0 }, "unit": 0, "version": 1 } },
-              "sceneSelection": { "type": 0, "name": "Monitor", "canvasSelection": "Main" },
-              "type": 10,
-              "pattern": ".*Scene.*",
-              "useTransitionTargetScene": false,
-              "regexConfig": { "enable": true, "partial": false, "options": 0 },
-              "version": 1
-            }
-          ],
-          "actions": [
-            {
-              "segmentSettings": { "collapsed": false, "useCustomLabel": false, "customLabel": "My label", "enabled": true, "version": 1 },
-              "id": "scene_switch",
-              "action": 0,
-              "canvas": "",
-              "index": { "value": 1, "type": 0 },
-              "sceneSelection": { "type": 0, "name": "Events", "canvasSelection": "Main" },
-              "transitionType": 0,
-              "transition": "",
-              "duration": { "value": { "value": 0.0, "type": 0 }, "unit": 0, "version": 1 },
-              "blockUntilTransitionDone": true,
-              "sceneType": 0
-            }
-          ],
-          "elseActions": [],
-          "inputVariables": []
-        },
-        {
-          "name": "Events-Earthquakes",
-          "group": false,
-          "pauseSaveBehavior": 0,
-          "pause": false,
-          "parallel": false,
-          "checkConditionsInParallel": false,
-          "onChange": true,
-          "skipExecOnStart": false,
-          "stopActionsIfNotDone": false,
-          "useShortCircuitEvaluation": false,
-          "useCustomConditionCheckInterval": false,
-          "customConditionCheckInterval": { "value": { "value": 0.29999999999999999, "type": 0 }, "unit": 0, "version": 1 },
-          "dockSettings": {
-            "register": false,
-            "standaloneDock": true,
-            "dockWindow": "Dock",
-            "hasRunButton": true,
-            "hasPauseButton": true,
-            "hasStatusLabel": false,
-            "highlightIfConditionsTrue": false,
-            "runButtonText": "Run",
-            "pauseButtonText": "Pause",
-            "unpauseButtonText": "Unpause",
-            "conditionsTrueStatusText": "Conditions are true.",
-            "conditionsFalseStatusText": "Conditions are false.",
-            "dockId": "advss-macro-dock-events-eq",
-            "version": 1
-          },
-          "macroActionConditionSplitterPosition": [{ "pos": 192 }, { "pos": 191 }],
-          "macroElseActionSplitterPosition": [{ "pos": 159 }, { "pos": 0 }],
-          "registerHotkeys": false,
-          "pauseHotkey": [],
-          "unpauseHotkey": [],
-          "togglePauseHotkey": [],
-          "conditions": [
-            {
-              "segmentSettings": { "collapsed": false, "useCustomLabel": false, "customLabel": "My label", "enabled": true, "version": 1 },
-              "id": "scene",
-              "logic": 0,
-              "durationModifier": { "time_constraint": 2, "seconds": { "value": { "value": 60.0, "type": 0 }, "unit": 0, "version": 1 } },
-              "sceneSelection": { "type": 0, "name": "Events", "canvasSelection": "Main" },
-              "type": 10,
-              "pattern": ".*Scene.*",
-              "useTransitionTargetScene": false,
-              "regexConfig": { "enable": true, "partial": false, "options": 0 },
-              "version": 1
-            }
-          ],
-          "actions": [
-            {
-              "segmentSettings": { "collapsed": false, "useCustomLabel": false, "customLabel": "My label", "enabled": true, "version": 1 },
-              "id": "scene_switch",
-              "action": 0,
-              "canvas": "",
-              "index": { "value": 1, "type": 0 },
-              "sceneSelection": { "type": 0, "name": "Earthquakes", "canvasSelection": "Main" },
-              "transitionType": 0,
-              "transition": "",
-              "duration": { "value": { "value": 0.0, "type": 0 }, "unit": 0, "version": 1 },
-              "blockUntilTransitionDone": true,
-              "sceneType": 0
-            }
-          ],
-          "elseActions": [],
-          "inputVariables": []
-        },
-        {
-          "name": "Earthquakes-Monitor",
-          "group": false,
-          "pauseSaveBehavior": 0,
-          "pause": false,
-          "parallel": false,
-          "checkConditionsInParallel": false,
-          "onChange": true,
-          "skipExecOnStart": false,
-          "stopActionsIfNotDone": false,
-          "useShortCircuitEvaluation": false,
-          "useCustomConditionCheckInterval": false,
-          "customConditionCheckInterval": { "value": { "value": 0.29999999999999999, "type": 0 }, "unit": 0, "version": 1 },
-          "dockSettings": {
-            "register": false,
-            "standaloneDock": true,
-            "dockWindow": "Dock",
-            "hasRunButton": true,
-            "hasPauseButton": true,
-            "hasStatusLabel": false,
-            "highlightIfConditionsTrue": false,
-            "runButtonText": "Run",
-            "pauseButtonText": "Pause",
-            "unpauseButtonText": "Unpause",
-            "conditionsTrueStatusText": "Conditions are true.",
-            "conditionsFalseStatusText": "Conditions are false.",
-            "dockId": "advss-macro-dock-eq-monitor",
-            "version": 1
-          },
-          "macroActionConditionSplitterPosition": [{ "pos": 192 }, { "pos": 191 }],
-          "macroElseActionSplitterPosition": [{ "pos": 159 }, { "pos": 0 }],
-          "registerHotkeys": false,
-          "pauseHotkey": [],
-          "unpauseHotkey": [],
-          "togglePauseHotkey": [],
-          "conditions": [
-            {
-              "segmentSettings": { "collapsed": false, "useCustomLabel": false, "customLabel": "My label", "enabled": true, "version": 1 },
-              "id": "scene",
-              "logic": 0,
-              "durationModifier": { "time_constraint": 2, "seconds": { "value": { "value": 60.0, "type": 0 }, "unit": 0, "version": 1 } },
-              "sceneSelection": { "type": 0, "name": "Earthquakes", "canvasSelection": "Main" },
-              "type": 10,
-              "pattern": ".*Scene.*",
-              "useTransitionTargetScene": false,
-              "regexConfig": { "enable": true, "partial": false, "options": 0 },
-              "version": 1
-            }
-          ],
-          "actions": [
-            {
-              "segmentSettings": { "collapsed": false, "useCustomLabel": false, "customLabel": "My label", "enabled": true, "version": 1 },
-              "id": "scene_switch",
-              "action": 0,
-              "canvas": "",
-              "index": { "value": 1, "type": 0 },
-              "sceneSelection": { "type": 0, "name": "Monitor", "canvasSelection": "Main" },
-              "transitionType": 0,
-              "transition": "",
-              "duration": { "value": { "value": 0.0, "type": 0 }, "unit": 0, "version": 1 },
-              "blockUntilTransitionDone": true,
-              "sceneType": 0
-            }
-          ],
-          "elseActions": [],
-          "inputVariables": []
-        }
-      ],
-      "macroSettings": {
-        "highlightExecuted": false,
-        "highlightConditions": false,
-        "highlightActions": false,
-        "newMacroCheckInParallel": false,
-        "newMacroRegisterHotkey": false,
-        "newMacroUseShortCircuitEvaluation": false,
-        "saveSettingsOnMacroChange": true
-      },
-      "variables": [],
-      "switches": [],
-      "ignoreWindows": [],
-      "screenRegion": [],
-      "pauseEntries": [],
-      "sceneRoundTrip": [],
-      "sceneTransitions": [],
-      "defaultTransitions": [],
-      "defTransitionDelay": 0,
-      "ignoreIdleWindows": [],
-      "idleTargetType": 0,
-      "idleSceneName": "",
-      "idleTransitionName": "",
-      "idleEnable": false,
-      "idleTime": 60,
-      "executableSwitches": [],
-      "randomSwitches": [],
-      "fileSwitches": [],
-      "readEnabled": false,
-      "readPath": "",
-      "writeEnabled": false,
-      "writePath": "",
-      "mediaSwitches": [],
-      "timeSwitches": [],
-      "audioSwitches": [],
-      "audioFallbackTargetType": 0,
-      "audioFallbackScene": "",
-      "audioFallbackTransition": "",
-      "audioFallbackEnable": false,
-      "audioFallbackDuration": { "value": { "value": 0.0, "type": 0 }, "unit": 0, "version": 1 },
-      "videoSwitches": [],
-      "interval": 300,
-      "noMatchScene": { "sceneSelection": { "type": 0, "name": "", "canvasSelection": "Main" } },
-      "switch_if_not_matching": 0,
-      "noMatchDelay": { "value": { "value": 0.0, "type": 0 }, "unit": 0, "version": 1 },
-      "cooldown": { "value": { "value": 0.0, "type": 0 }, "unit": 0, "version": 1 },
-      "enableCooldown": false,
-      "active": true,
-      "startup_behavior": 0,
-      "autoStart": {
-        "event": 0,
-        "useAutoStartScene": false,
-        "sceneSelection": { "type": 0, "name": "", "canvasSelection": "Main" },
-        "name": "",
-        "regexConfig": { "enable": false, "partial": false, "options": 0 }
-      },
-      "logLevel": 0,
-      "logLevelVersion": 1,
-      "showSystemTrayNotifications": false,
-      "disableHints": false,
-      "disableFilterComboboxFilter": false,
-      "disableMacroWidgetCache": false,
-      "warnPluginLoadFailure": true,
-      "hideLegacyTabs": true,
-      "priority0": 10,
-      "priority1": 0,
-      "priority2": 2,
-      "priority3": 8,
-      "priority4": 6,
-      "priority5": 9,
-      "priority6": 7,
-      "priority7": 4,
-      "priority8": 1,
-      "priority9": 5,
-      "priority10": 3,
-      "threadPriority": 3,
-      "transitionOverrideOverride": false,
-      "adjustActiveTransitionType": true,
-      "lastImportPath": "",
-      "startHotkey": [],
-      "stopHotkey": [],
-      "toggleHotkey": [],
-      "newMacroHotkey": [{ "control": true, "key": "OBS_KEY_N" }],
-      "upMacroSegmentHotkey": [],
-      "downMacroSegmentHotkey": [],
-      "removeMacroSegmentHotkey": [],
-      "tabWidgetOrder": [
-        { "generalTab": 0 },
-        { "macroTab": 1 },
-        { "windowTitleTab": 2 },
-        { "executableTab": 3 },
-        { "screenRegionTab": 4 },
-        { "mediaTab": 5 },
-        { "fileTab": 6 },
-        { "randomTab": 7 },
-        { "timeTab": 8 },
-        { "idleTab": 9 },
-        { "sceneSequenceTab": 10 },
-        { "audioTab": 11 },
-        { "videoTab": 12 },
-        { "sceneGroupTab": 13 },
-        { "transitionsTab": 14 },
-        { "pauseTab": 15 },
-        { "websocketConnectionTab": 16 },
-        { "twitchConnectionTab": 17 },
-        { "variableTab": 18 },
-        { "actionQueueTab": 19 }
-      ],
-      "saveWindowGeo": false,
-      "windowPosX": 89,
-      "windowPosY": 72,
-      "windowWidth": 1000,
-      "windowHeight": 600,
-      "macroListMacroEditSplitterPosition": [{ "pos": 136 }, { "pos": 838 }],
-      "version": "a0e6e6f528d78d35950dd71ad8aaa54aef4b27af",
-      "tabSettings": { "searchType": 0, "searchString": "", "regexConfig": { "enable": false, "partial": false, "options": 0 } },
-      "dockSettings": { "searchType": 0, "searchString": "", "regexConfig": { "enable": false, "partial": false, "options": 0 } },
-      "addVariablesDock": false,
-      "websocketConnections": [],
-      "twitchConnections": [],
-      "actionQueues": [],
-      "dockWindows": { "docks": [] }
-    }
+    "scripts-tool": []
   },
   "resolution": {
     "x": 1920,
@@ -418,347 +78,14 @@
   "sources": [
     {
       "prev_ver": 503447555,
-      "name": "Browser",
-      "uuid": "d8310e95-a5b4-4fb3-ae35-9d5da5679ad9",
-      "id": "browser_source",
-      "versioned_id": "browser_source",
-      "settings": {
-        "width": 1920,
-        "height": 1080,
-        "restart_when_active": false,
-        "webpage_control_level": 2,
-        "css": "",
-        "url": "https://monitor.fifthbell.com?categories=world,business,politics,sports"
-      },
-      "mixers": 255,
-      "sync": 0,
-      "flags": 0,
-      "volume": 1.0,
-      "balance": 0.5,
-      "enabled": true,
-      "muted": false,
-      "push-to-mute": false,
-      "push-to-mute-delay": 0,
-      "push-to-talk": false,
-      "push-to-talk-delay": 0,
-      "hotkeys": {
-        "libobs.mute": [],
-        "libobs.unmute": [],
-        "libobs.push-to-mute": [],
-        "libobs.push-to-talk": [],
-        "ObsBrowser.Refresh": []
-      },
-      "deinterlace_mode": 0,
-      "deinterlace_field_order": 0,
-      "monitoring_type": 0,
-      "private_settings": {}
-    },
-    {
-      "prev_ver": 503447555,
-      "name": "EventsBrowser",
-      "uuid": "e5f6a7b8-c9d0-4e1f-a2b3-c4d5e6f7a8b9",
-      "id": "browser_source",
-      "versioned_id": "browser_source",
-      "settings": {
-        "width": 1920,
-        "height": 1080,
-        "restart_when_active": false,
-        "url": "https://monitor.fifthbell.com/events"
-      },
-      "mixers": 255,
-      "sync": 0,
-      "flags": 0,
-      "volume": 1.0,
-      "balance": 0.5,
-      "enabled": true,
-      "muted": false,
-      "push-to-mute": false,
-      "push-to-mute-delay": 0,
-      "push-to-talk": false,
-      "push-to-talk-delay": 0,
-      "hotkeys": {
-        "libobs.mute": [],
-        "libobs.unmute": [],
-        "libobs.push-to-mute": [],
-        "libobs.push-to-talk": [],
-        "ObsBrowser.Refresh": []
-      },
-      "deinterlace_mode": 0,
-      "deinterlace_field_order": 0,
-      "monitoring_type": 0,
-      "private_settings": {}
-    },
-    {
-      "prev_ver": 503447555,
-      "name": "Events",
-      "uuid": "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
-      "id": "scene",
-      "versioned_id": "scene",
-      "settings": {
-        "id_counter": 2,
-        "custom_size": false,
-        "items": [
-          {
-            "name": "Media Playlist Source",
-            "source_uuid": "951870f1-f631-4be7-86d0-2739abeb7c4d",
-            "visible": true,
-            "locked": false,
-            "rot": 0.0,
-            "pos": {
-              "x": 0.0,
-              "y": 0.0
-            },
-            "scale": {
-              "x": 1.0,
-              "y": 1.0
-            },
-            "align": 5,
-            "bounds_type": 0,
-            "bounds_align": 0,
-            "bounds_crop": false,
-            "bounds": {
-              "x": 0.0,
-              "y": 0.0
-            },
-            "crop_left": 0,
-            "crop_top": 0,
-            "crop_right": 0,
-            "crop_bottom": 0,
-            "id": 1,
-            "group_item_backup": false,
-            "scale_filter": "disable",
-            "blend_method": "default",
-            "blend_type": "normal",
-            "show_transition": {
-              "duration": 0
-            },
-            "hide_transition": {
-              "duration": 0
-            },
-            "private_settings": {}
-          },
-          {
-            "name": "EventsBrowser",
-            "source_uuid": "e5f6a7b8-c9d0-4e1f-a2b3-c4d5e6f7a8b9",
-            "visible": true,
-            "locked": false,
-            "rot": 0.0,
-            "pos": {
-              "x": 0.0,
-              "y": 0.0
-            },
-            "scale": {
-              "x": 1.0,
-              "y": 1.0
-            },
-            "align": 5,
-            "bounds_type": 0,
-            "bounds_align": 0,
-            "bounds_crop": false,
-            "bounds": {
-              "x": 0.0,
-              "y": 0.0
-            },
-            "crop_left": 0,
-            "crop_top": 0,
-            "crop_right": 0,
-            "crop_bottom": 0,
-            "id": 2,
-            "group_item_backup": false,
-            "scale_filter": "disable",
-            "blend_method": "default",
-            "blend_type": "normal",
-            "show_transition": {
-              "duration": 0
-            },
-            "hide_transition": {
-              "duration": 0
-            },
-            "private_settings": {}
-          }
-        ]
-      },
-      "mixers": 0,
-      "sync": 0,
-      "flags": 0,
-      "volume": 1.0,
-      "balance": 0.5,
-      "enabled": true,
-      "muted": false,
-      "push-to-mute": false,
-      "push-to-mute-delay": 0,
-      "push-to-talk": false,
-      "push-to-talk-delay": 0,
-      "hotkeys": {
-        "OBSBasic.SelectScene": [],
-        "libobs.show_scene_item.1": [],
-        "libobs.hide_scene_item.1": [],
-        "libobs.show_scene_item.2": [],
-        "libobs.hide_scene_item.2": []
-      },
-      "deinterlace_mode": 0,
-      "deinterlace_field_order": 0,
-      "monitoring_type": 0,
-      "private_settings": {}
-    },
-    {
-      "prev_ver": 503447555,
-      "name": "Earthquakes",
-      "uuid": "37c723a3-4379-4255-bf84-cb2a324a9c57",
-      "id": "scene",
-      "versioned_id": "scene",
-      "settings": {
-        "id_counter": 3,
-        "custom_size": false,
-        "items": [
-          {
-            "name": "Media Playlist Source",
-            "source_uuid": "951870f1-f631-4be7-86d0-2739abeb7c4d",
-            "visible": true,
-            "locked": false,
-            "rot": 0.0,
-            "pos": {
-              "x": 0.0,
-              "y": 0.0
-            },
-            "scale": {
-              "x": 1.0,
-              "y": 1.0
-            },
-            "align": 5,
-            "bounds_type": 0,
-            "bounds_align": 0,
-            "bounds_crop": false,
-            "bounds": {
-              "x": 0.0,
-              "y": 0.0
-            },
-            "crop_left": 0,
-            "crop_top": 0,
-            "crop_right": 0,
-            "crop_bottom": 0,
-            "id": 2,
-            "group_item_backup": false,
-            "scale_filter": "disable",
-            "blend_method": "default",
-            "blend_type": "normal",
-            "show_transition": {
-              "duration": 0
-            },
-            "hide_transition": {
-              "duration": 0
-            },
-            "private_settings": {}
-          },
-          {
-            "name": "EarthquakesBrowser",
-            "source_uuid": "bccc104f-c48f-4dc8-9ac0-ebdf6e1d0046",
-            "visible": true,
-            "locked": false,
-            "rot": 0.0,
-            "pos": {
-              "x": 0.0,
-              "y": 0.0
-            },
-            "scale": {
-              "x": 1.0,
-              "y": 1.0
-            },
-            "align": 5,
-            "bounds_type": 0,
-            "bounds_align": 0,
-            "bounds_crop": false,
-            "bounds": {
-              "x": 0.0,
-              "y": 0.0
-            },
-            "crop_left": 0,
-            "crop_top": 0,
-            "crop_right": 0,
-            "crop_bottom": 0,
-            "id": 3,
-            "group_item_backup": false,
-            "scale_filter": "disable",
-            "blend_method": "default",
-            "blend_type": "normal",
-            "show_transition": {
-              "duration": 0
-            },
-            "hide_transition": {
-              "duration": 0
-            },
-            "private_settings": {}
-          }
-        ]
-      },
-      "mixers": 0,
-      "sync": 0,
-      "flags": 0,
-      "volume": 1.0,
-      "balance": 0.5,
-      "enabled": true,
-      "muted": false,
-      "push-to-mute": false,
-      "push-to-mute-delay": 0,
-      "push-to-talk": false,
-      "push-to-talk-delay": 0,
-      "hotkeys": {
-        "OBSBasic.SelectScene": [],
-        "libobs.show_scene_item.2": [],
-        "libobs.hide_scene_item.2": [],
-        "libobs.show_scene_item.3": [],
-        "libobs.hide_scene_item.3": []
-      },
-      "deinterlace_mode": 0,
-      "deinterlace_field_order": 0,
-      "monitoring_type": 0,
-      "private_settings": {}
-    },
-    {
-      "prev_ver": 503447555,
-      "name": "EarthquakesBrowser",
-      "uuid": "bccc104f-c48f-4dc8-9ac0-ebdf6e1d0046",
-      "id": "browser_source",
-      "versioned_id": "browser_source",
-      "settings": {
-        "width": 1920,
-        "height": 1080,
-        "restart_when_active": false,
-        "url": "https://monitor.fifthbell.com/earthquakes/dashboard"
-      },
-      "mixers": 255,
-      "sync": 0,
-      "flags": 0,
-      "volume": 1.0,
-      "balance": 0.5,
-      "enabled": true,
-      "muted": false,
-      "push-to-mute": false,
-      "push-to-mute-delay": 0,
-      "push-to-talk": false,
-      "push-to-talk-delay": 0,
-      "hotkeys": {
-        "libobs.mute": [],
-        "libobs.unmute": [],
-        "libobs.push-to-mute": [],
-        "libobs.push-to-talk": [],
-        "ObsBrowser.Refresh": []
-      },
-      "deinterlace_mode": 0,
-      "deinterlace_field_order": 0,
-      "monitoring_type": 0,
-      "private_settings": {}
-    },
-    {
-      "prev_ver": 503447555,
       "name": "Media Playlist Source",
       "uuid": "951870f1-f631-4be7-86d0-2739abeb7c4d",
       "id": "media_playlist_source_codeyan",
       "versioned_id": "media_playlist_source_codeyan",
       "settings": {
-        "current_media_index": 6,
+        "current_media_index": 0,
         "current_folder_item_filename": "",
-        "select_file": "7",
+        "select_file": "1",
         "playlist": [
           {
             "value": "/media/1.mp3",
@@ -837,9 +164,45 @@
           }
         ],
         "shuffle": true,
-        "current_file_name": "7: /media/7.mp3"
+        "current_file_name": "1: /media/1.mp3"
       },
       "mixers": 255,
+      "sync": 0,
+      "flags": 0,
+      "volume": 0.25119,
+      "balance": 0.5,
+      "enabled": true,
+      "muted": false,
+      "push-to-mute": false,
+      "push-to-mute-delay": 0,
+      "push-to-talk": false,
+      "push-to-talk-delay": 0,
+      "hotkeys": {},
+      "deinterlace_mode": 0,
+      "deinterlace_field_order": 0,
+      "monitoring_type": 0,
+      "private_settings": {}
+    },
+    {
+      "prev_ver": 503447555,
+      "name": "Channel",
+      "uuid": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "id": "ffmpeg_source",
+      "versioned_id": "ffmpeg_source",
+      "settings": {
+        "buffering_mb": 1,
+        "clear_on_media_end": false,
+        "close_when_inactive": false,
+        "ffmpeg_options": "video_size=1920x1080 framerate=30 draw_mouse=0",
+        "hw_decode": false,
+        "input": ":98.0+0,0",
+        "input_format": "x11grab",
+        "is_local_file": false,
+        "log_changes": true,
+        "reconnect_delay_sec": 1,
+        "restart_on_activate": true
+      },
+      "mixers": 0,
       "sync": 0,
       "flags": 0,
       "volume": 1.0,
@@ -850,17 +213,7 @@
       "push-to-mute-delay": 0,
       "push-to-talk": false,
       "push-to-talk-delay": 0,
-      "hotkeys": {
-        "libobs.mute": [],
-        "libobs.unmute": [],
-        "libobs.push-to-mute": [],
-        "libobs.push-to-talk": [],
-        "MediaPlaylistSource.PlayPause": [],
-        "MediaPlaylistSource.Restart": [],
-        "MediaPlaylistSource.Stop": [],
-        "MediaPlaylistSource.PlaylistNext": [],
-        "MediaPlaylistSource.PlaylistPrev": []
-      },
+      "hotkeys": {},
       "deinterlace_mode": 0,
       "deinterlace_field_order": 0,
       "monitoring_type": 0,
@@ -868,13 +221,13 @@
     },
     {
       "prev_ver": 503447555,
-      "name": "Monitor",
+      "name": "Main",
       "uuid": "d1bfb5e7-c6d7-4438-a1e3-fbdab7ef86f8",
       "id": "scene",
       "versioned_id": "scene",
       "settings": {
         "custom_size": false,
-        "id_counter": 5,
+        "id_counter": 2,
         "items": [
           {
             "name": "Media Playlist Source",
@@ -902,7 +255,7 @@
             "crop_top": 0,
             "crop_right": 0,
             "crop_bottom": 0,
-            "id": 3,
+            "id": 1,
             "group_item_backup": false,
             "scale_filter": "disable",
             "blend_method": "default",
@@ -916,8 +269,8 @@
             "private_settings": {}
           },
           {
-            "name": "Browser",
-            "source_uuid": "d8310e95-a5b4-4fb3-ae35-9d5da5679ad9",
+            "name": "Channel",
+            "source_uuid": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
             "visible": true,
             "locked": false,
             "rot": 0.0,
@@ -941,7 +294,7 @@
             "crop_top": 0,
             "crop_right": 0,
             "crop_bottom": 0,
-            "id": 5,
+            "id": 2,
             "group_item_backup": false,
             "scale_filter": "disable",
             "blend_method": "default",
@@ -968,11 +321,7 @@
       "push-to-talk": false,
       "push-to-talk-delay": 0,
       "hotkeys": {
-        "OBSBasic.SelectScene": [],
-        "libobs.show_scene_item.3": [],
-        "libobs.hide_scene_item.3": [],
-        "libobs.show_scene_item.5": [],
-        "libobs.hide_scene_item.5": []
+        "OBSBasic.SelectScene": []
       },
       "deinterlace_mode": 0,
       "deinterlace_field_order": 0,
