@@ -255,7 +255,7 @@ ApplyServiceSettings=true
 UseRescale=false
 TrackIndex=1
 VodTrackIndex=2
-Encoder=obs_qsv11_v2
+Encoder=obs_x264
 RecFilePath=/config
 RecUseRescale=false
 RecTracks=1
@@ -281,8 +281,8 @@ RecSplitFileSize=2048
 RecRB=false
 RecRBTime=20
 RecRBSize=512
-AudioEncoder=libfdk_aac
-RecAudioEncoder=libfdk_aac
+AudioEncoder=ffmpeg_aac
+RecAudioEncoder=ffmpeg_aac
 EOF
 
 # Set the scene collection in global.ini
@@ -360,6 +360,23 @@ cat > /config/.config/obs-studio/basic/profiles/Untitled/service.json << EOF
         "multitrack_video_name": "Multitrack Video",
         "multitrack_video_disclaimer": "Multitrack Video automatically optimizes your settings to encode and send multiple video qualities to YouTube - RTMPS. Selecting this option will send YouTube - RTMPS information about your computer and software setup."
     }
+}
+EOF
+
+# Keep the obs-browser CEF subprocess aligned with the container rendering mode.
+# BrowserHWAccel is the key obs-browser actually reads (NOT global.ini).
+mkdir -p /config/.config/obs-studio/plugin_config/obs-browser
+
+if [ "${OBS_FORCE_SOFTWARE_RENDERING:-true}" = "true" ]; then
+    OBS_BROWSER_ARGS="--no-sandbox --disable-gpu --disable-gpu-compositing --disable-gpu-sandbox --disable-dev-shm-usage --use-gl=swiftshader --enable-unsafe-swiftshader"
+else
+    OBS_BROWSER_ARGS="--no-sandbox --disable-gpu-sandbox --disable-dev-shm-usage"
+fi
+
+cat > /config/.config/obs-studio/plugin_config/obs-browser/settings.json << EOF
+{
+    "BrowserHWAccel": true,
+    "ExtraCommandLineArgs": "${OBS_BROWSER_ARGS}"
 }
 EOF
 

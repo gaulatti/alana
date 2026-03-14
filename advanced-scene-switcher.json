@@ -1,6 +1,7 @@
 {
   "sceneGroups": [],
-  "macros": [
+  "macros": [],
+  "REMOVED_macros_placeholder": [
     {
       "name": "Monitor-Events",
       "group": false,
