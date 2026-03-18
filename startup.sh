@@ -78,7 +78,7 @@ cat > /tmp/obs-browser-test.html <<'HTML'
 </html>
 HTML
 
-CHANNEL_BROWSER_URL="${CHANNEL_BROWSER_URL:-https://d2cg1aux9m1ka0.cloudfront.net/channel}"
+CHANNEL_BROWSER_URL="${CHANNEL_BROWSER_URL:-https://alcantara.gaulatti.com/program/fifthbell}"
 CHANNEL_BROWSER="${CHANNEL_BROWSER:-chrome}"
 
 # 1. Create a stable startup file: Launch TWM, a persistent terminal, AND OBS
