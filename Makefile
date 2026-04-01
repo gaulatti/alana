@@ -5,17 +5,32 @@ IMAGE_TAG        ?= amd64
 PLATFORM         ?= linux/amd64
 DOCKERFILE       ?= Dockerfile
 CONTAINER_NAME   ?= alana
+SHM_SIZE         ?= 1g
 
-# You can export this in your shell: export YOUTUBE_STREAM_KEY=...
+# Export this in your shell: export YOUTUBE_STREAM_KEY=...
 YOUTUBE_STREAM_KEY ?=
 
-# obs-websocket configuration
-# Set a password for production use: export OBS_WEBSOCKET_PASSWORD=your_password
-OBS_WEBSOCKET_PASSWORD ?=
-OBS_WEBSOCKET_PORT ?= 4455
-
-# Legacy mode: set to "true" to enable static scene import (DEPRECATED)
-OBS_LEGACY_MODE ?= false
+# URL of the React channel page to render and stream
+CHANNEL_BROWSER_URL ?= 
+RESOLUTION ?=
+WINDOW_SIZE ?=
+FPS ?=
+DRAW_MOUSE ?=
+VIDEO_ENCODER ?=
+VIDEO_BITRATE ?=
+VIDEO_MAXRATE ?=
+VIDEO_BUFSIZE ?=
+X264_PRESET ?=
+GOP_SIZE ?=
+AUDIO_BITRATE ?=
+VAAPI_DEVICE ?=
+VAAPI_DRIVER ?=
+DISABLE_CHROME_GPU ?=
+CHROME_SOFTWARE_GL ?=
+CHROME_DISABLE_DEV_SHM_USAGE ?=
+CHROME_ENABLE_PERF_FLAGS ?=
+CHROME_EXTRA_FLAGS ?=
+FFMPEG_LOGLEVEL ?=
 
 # Optional device mapping (used only on Linux host)
 # On your Linux box you can run:
@@ -41,16 +56,29 @@ run:
 		--platform $(PLATFORM) \
 		--name=$(CONTAINER_NAME) \
 		--restart=always \
-		--shm-size=1g \
+		--shm-size=$(SHM_SIZE) \
 		$(DEVICE_FLAGS) \
-		-v "$(PWD)/music":/media \
-		-v "$(PWD)/video":/video \
 		-e YOUTUBE_STREAM_KEY="$(YOUTUBE_STREAM_KEY)" \
-		-e OBS_WEBSOCKET_PASSWORD="$(OBS_WEBSOCKET_PASSWORD)" \
-		-e OBS_WEBSOCKET_PORT="$(OBS_WEBSOCKET_PORT)" \
-		-e OBS_LEGACY_MODE="$(OBS_LEGACY_MODE)" \
-		-p 4455:4455 \
-		-p 5901:5901 \
+		-e CHANNEL_BROWSER_URL="$(CHANNEL_BROWSER_URL)" \
+		-e RESOLUTION="$(RESOLUTION)" \
+		-e WINDOW_SIZE="$(WINDOW_SIZE)" \
+		-e FPS="$(FPS)" \
+		-e DRAW_MOUSE="$(DRAW_MOUSE)" \
+		-e VIDEO_ENCODER="$(VIDEO_ENCODER)" \
+		-e VIDEO_BITRATE="$(VIDEO_BITRATE)" \
+		-e VIDEO_MAXRATE="$(VIDEO_MAXRATE)" \
+		-e VIDEO_BUFSIZE="$(VIDEO_BUFSIZE)" \
+		-e X264_PRESET="$(X264_PRESET)" \
+		-e GOP_SIZE="$(GOP_SIZE)" \
+		-e AUDIO_BITRATE="$(AUDIO_BITRATE)" \
+		-e VAAPI_DEVICE="$(VAAPI_DEVICE)" \
+		-e VAAPI_DRIVER="$(VAAPI_DRIVER)" \
+		-e DISABLE_CHROME_GPU="$(DISABLE_CHROME_GPU)" \
+		-e CHROME_SOFTWARE_GL="$(CHROME_SOFTWARE_GL)" \
+		-e CHROME_DISABLE_DEV_SHM_USAGE="$(CHROME_DISABLE_DEV_SHM_USAGE)" \
+		-e CHROME_ENABLE_PERF_FLAGS="$(CHROME_ENABLE_PERF_FLAGS)" \
+		-e CHROME_EXTRA_FLAGS="$(CHROME_EXTRA_FLAGS)" \
+		-e FFMPEG_LOGLEVEL="$(FFMPEG_LOGLEVEL)" \
 		$(IMAGE_NAME):$(IMAGE_TAG)
 
 shell:
@@ -58,16 +86,29 @@ shell:
 	docker run --rm -it \
 		--platform $(PLATFORM) \
 		--name=$(CONTAINER_NAME)-shell \
-		--shm-size=1g \
+		--shm-size=$(SHM_SIZE) \
 		$(DEVICE_FLAGS) \
-		-v "$(PWD)/music":/media \
-		-v "$(PWD)/video":/video \
 		-e YOUTUBE_STREAM_KEY="$(YOUTUBE_STREAM_KEY)" \
-		-e OBS_WEBSOCKET_PASSWORD="$(OBS_WEBSOCKET_PASSWORD)" \
-		-e OBS_WEBSOCKET_PORT="$(OBS_WEBSOCKET_PORT)" \
-		-e OBS_LEGACY_MODE="$(OBS_LEGACY_MODE)" \
-		-p 4455:4455 \
-		-p 5901:5901 \
+		-e CHANNEL_BROWSER_URL="$(CHANNEL_BROWSER_URL)" \
+		-e RESOLUTION="$(RESOLUTION)" \
+		-e WINDOW_SIZE="$(WINDOW_SIZE)" \
+		-e FPS="$(FPS)" \
+		-e DRAW_MOUSE="$(DRAW_MOUSE)" \
+		-e VIDEO_ENCODER="$(VIDEO_ENCODER)" \
+		-e VIDEO_BITRATE="$(VIDEO_BITRATE)" \
+		-e VIDEO_MAXRATE="$(VIDEO_MAXRATE)" \
+		-e VIDEO_BUFSIZE="$(VIDEO_BUFSIZE)" \
+		-e X264_PRESET="$(X264_PRESET)" \
+		-e GOP_SIZE="$(GOP_SIZE)" \
+		-e AUDIO_BITRATE="$(AUDIO_BITRATE)" \
+		-e VAAPI_DEVICE="$(VAAPI_DEVICE)" \
+		-e VAAPI_DRIVER="$(VAAPI_DRIVER)" \
+		-e DISABLE_CHROME_GPU="$(DISABLE_CHROME_GPU)" \
+		-e CHROME_SOFTWARE_GL="$(CHROME_SOFTWARE_GL)" \
+		-e CHROME_DISABLE_DEV_SHM_USAGE="$(CHROME_DISABLE_DEV_SHM_USAGE)" \
+		-e CHROME_ENABLE_PERF_FLAGS="$(CHROME_ENABLE_PERF_FLAGS)" \
+		-e CHROME_EXTRA_FLAGS="$(CHROME_EXTRA_FLAGS)" \
+		-e FFMPEG_LOGLEVEL="$(FFMPEG_LOGLEVEL)" \
 		$(IMAGE_NAME):$(IMAGE_TAG) \
 		bash
 
