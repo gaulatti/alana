@@ -6,16 +6,11 @@ PLATFORM         ?= linux/amd64
 DOCKERFILE       ?= Dockerfile
 CONTAINER_NAME   ?= alana
 
-# You can export this in your shell: export YOUTUBE_STREAM_KEY=...
+# Export this in your shell: export YOUTUBE_STREAM_KEY=...
 YOUTUBE_STREAM_KEY ?=
 
-# obs-websocket configuration
-# Set a password for production use: export OBS_WEBSOCKET_PASSWORD=your_password
-OBS_WEBSOCKET_PASSWORD ?=
-OBS_WEBSOCKET_PORT ?= 4455
-
-# Legacy mode: set to "true" to enable static scene import (DEPRECATED)
-OBS_LEGACY_MODE ?= false
+# URL of the React channel page to render and stream
+CHANNEL_BROWSER_URL ?= https://alcantara.gaulatti.com/program/fifthbell
 
 # Optional device mapping (used only on Linux host)
 # On your Linux box you can run:
@@ -46,11 +41,7 @@ run:
 		-v "$(PWD)/music":/media \
 		-v "$(PWD)/video":/video \
 		-e YOUTUBE_STREAM_KEY="$(YOUTUBE_STREAM_KEY)" \
-		-e OBS_WEBSOCKET_PASSWORD="$(OBS_WEBSOCKET_PASSWORD)" \
-		-e OBS_WEBSOCKET_PORT="$(OBS_WEBSOCKET_PORT)" \
-		-e OBS_LEGACY_MODE="$(OBS_LEGACY_MODE)" \
-		-p 4455:4455 \
-		-p 5901:5901 \
+		-e CHANNEL_BROWSER_URL="$(CHANNEL_BROWSER_URL)" \
 		$(IMAGE_NAME):$(IMAGE_TAG)
 
 shell:
@@ -63,11 +54,7 @@ shell:
 		-v "$(PWD)/music":/media \
 		-v "$(PWD)/video":/video \
 		-e YOUTUBE_STREAM_KEY="$(YOUTUBE_STREAM_KEY)" \
-		-e OBS_WEBSOCKET_PASSWORD="$(OBS_WEBSOCKET_PASSWORD)" \
-		-e OBS_WEBSOCKET_PORT="$(OBS_WEBSOCKET_PORT)" \
-		-e OBS_LEGACY_MODE="$(OBS_LEGACY_MODE)" \
-		-p 4455:4455 \
-		-p 5901:5901 \
+		-e CHANNEL_BROWSER_URL="$(CHANNEL_BROWSER_URL)" \
 		$(IMAGE_NAME):$(IMAGE_TAG) \
 		bash
 

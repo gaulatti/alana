@@ -1,337 +1,238 @@
 #!/bin/bash
+# OBS-less streaming entrypoint
+# Pipeline: Xvfb :98 → Chrome (renders CHANNEL_BROWSER_URL) → ffmpeg x11grab+pulse → RTMPS → YouTube
 
-# Set up GPU device permissions
+CHANNEL_BROWSER_URL="${CHANNEL_BROWSER_URL:-https://alcantara.gaulatti.com/program/fifthbell}"
+DISPLAY_NUM=":98"
+RESOLUTION="1920x1080"
+FPS=30
+YOUTUBE_RTMPS_URL="rtmps://a.rtmps.youtube.com:443/live2"
+STALL_TIMEOUT=30   # seconds without frame progress → restart ffmpeg
+RESTART_BACKOFF=5  # initial backoff between ffmpeg restarts (seconds)
+MAX_BACKOFF=60     # maximum backoff cap (seconds)
+
+BROWSER_LOG="/tmp/channel-browser.log"
+BROWSER_PID_FILE="/tmp/channel-browser.pid"
+FFMPEG_LOG="/tmp/ffmpeg.log"
+FFMPEG_PROGRESS="/tmp/ffmpeg-progress.txt"
+
+# ---------------------------------------------------------------------------
+# 0. GPU device permissions (no-op when devices are absent)
+# ---------------------------------------------------------------------------
 if [ -e /dev/dri/card0 ]; then
     chmod 666 /dev/dri/card0
 fi
 
 if [ -e /dev/dri/renderD129 ]; then
     RENDER_GID=$(stat -c '%g' /dev/dri/renderD129)
-    groupadd -g $RENDER_GID render 2>/dev/null || true
-    usermod -a -G $RENDER_GID root 2>/dev/null || true
+    groupadd -g "$RENDER_GID" render 2>/dev/null || true
+    usermod -a -G "$RENDER_GID" root 2>/dev/null || true
 fi
 
-cat > /tmp/obs-browser-test.html <<'HTML'
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>OBS Browser Test</title>
-    <style>
-      html, body {
-        margin: 0;
-        width: 100%;
-        height: 100%;
-        overflow: hidden;
-        background:
-          radial-gradient(circle at top left, #ffd166 0%, transparent 35%),
-          linear-gradient(135deg, #c1121f 0%, #003049 55%, #111111 100%);
-        color: #fdf0d5;
-        font-family: monospace;
-      }
+# ---------------------------------------------------------------------------
+# 1. PulseAudio: start daemon, create null sink, set as default
+# ---------------------------------------------------------------------------
+mkdir -p /tmp/runtime-root && chmod 700 /tmp/runtime-root
+export XDG_RUNTIME_DIR=/tmp/runtime-root
 
-      body {
-        display: grid;
-        place-items: center;
-      }
+echo "[pulseaudio] Starting daemon..." >&2
+pulseaudio --start --exit-idle-time=-1 --log-target=file:/tmp/pulseaudio.log 2>/dev/null || true
 
-      .card {
-        width: 80vw;
-        max-width: 1200px;
-        padding: 48px;
-        border: 6px solid rgba(253, 240, 213, 0.9);
-        background: rgba(0, 0, 0, 0.35);
-        box-shadow: 0 30px 80px rgba(0, 0, 0, 0.45);
-      }
-
-      h1 {
-        margin: 0 0 24px;
-        font-size: 96px;
-        line-height: 1;
-      }
-
-      p {
-        margin: 0 0 16px;
-        font-size: 36px;
-      }
-
-      .pulse {
-        display: inline-block;
-        margin-top: 24px;
-        padding: 12px 18px;
-        background: #ffd166;
-        color: #111111;
-        font-size: 28px;
-        font-weight: bold;
-      }
-    </style>
-  </head>
-  <body>
-    <div class="card">
-      <h1>OBS Browser Test</h1>
-      <p>If you can read this, browser rendering works.</p>
-      <p>No external network. No app JS bundle. No API fetches.</p>
-      <div class="pulse">LOCAL FILE RENDER CHECK</div>
-    </div>
-  </body>
-</html>
-HTML
-
-CHANNEL_BROWSER_URL="${CHANNEL_BROWSER_URL:-https://alcantara.gaulatti.com/program/fifthbell}"
-CHANNEL_BROWSER="${CHANNEL_BROWSER:-chrome}"
-
-# 1. Create a stable startup file: Launch TWM, a persistent terminal, AND OBS
-echo "#!/bin/sh" > /tmp/obs-xstartup
-echo "mkdir -p /tmp/runtime-root && chmod 700 /tmp/runtime-root" >> /tmp/obs-xstartup
-echo "export QT_QPA_PLATFORM=xcb" >> /tmp/obs-xstartup
-echo "export HOME=/config" >> /tmp/obs-xstartup
-echo "export XDG_RUNTIME_DIR=/tmp/runtime-root" >> /tmp/obs-xstartup
-echo "export CEF_REMOTE_DEBUGGING_PORT=9222" >> /tmp/obs-xstartup
-echo "export QTWEBENGINE_DISABLE_SANDBOX=1" >> /tmp/obs-xstartup
-echo "export LIBVA_DRIVER_NAME=iHD" >> /tmp/obs-xstartup
-echo "export LIBVA_DRIVERS_PATH=/usr/lib/x86_64-linux-gnu/dri" >> /tmp/obs-xstartup
-echo "export LIBVA_MESSAGING_LEVEL=2" >> /tmp/obs-xstartup
-
-if [ "${OBS_FORCE_SOFTWARE_RENDERING:-true}" = "true" ]; then
-    echo "export LIBGL_ALWAYS_SOFTWARE=1" >> /tmp/obs-xstartup
-    echo "export MESA_LOADER_DRIVER_OVERRIDE=llvmpipe" >> /tmp/obs-xstartup
-    echo "export QTWEBENGINE_CHROMIUM_FLAGS='--no-sandbox --disable-gpu --disable-gpu-compositing --disable-gpu-sandbox --disable-dev-shm-usage --use-gl=swiftshader --enable-unsafe-swiftshader'" >> /tmp/obs-xstartup
-    echo "export OBS_BROWSER_EXTRA_ARGS='--no-sandbox --disable-gpu --disable-gpu-compositing --disable-gpu-sandbox --disable-dev-shm-usage --use-gl=swiftshader --enable-unsafe-swiftshader'" >> /tmp/obs-xstartup
-    OBS_LAUNCH_FLAGS="--disable-gpu --disable-gpu-sandbox --use-gl=swiftshader"
-else
-    echo "export QTWEBENGINE_CHROMIUM_FLAGS='--no-sandbox --disable-gpu-sandbox --disable-dev-shm-usage'" >> /tmp/obs-xstartup
-    echo "export OBS_BROWSER_EXTRA_ARGS='--no-sandbox --disable-gpu-sandbox --disable-dev-shm-usage'" >> /tmp/obs-xstartup
-    OBS_LAUNCH_FLAGS="--disable-gpu-sandbox"
-fi
-
-# Create TWM config to place windows at 0,0 without interaction
-cat > /tmp/.twmrc << 'TWMRC'
-RandomPlacement
-NoDefaults
-DecorateTransients
-ShowIconManager
-IconManagerGeometry "100x5+0+0"
-BorderWidth 2
-TitleFont "-adobe-helvetica-bold-r-normal--*-120-*-*-*-*-*-*"
-ResizeFont "-adobe-helvetica-bold-r-normal--*-120-*-*-*-*-*-*"
-MenuFont "-adobe-helvetica-bold-r-normal--*-120-*-*-*-*-*-*"
-IconFont "-adobe-helvetica-bold-r-normal--*-100-*-*-*-*-*-*"
-
-Color
-{
-    BorderColor "slategrey"
-    DefaultBackground "rgb:2/a/9"
-    DefaultForeground "gray85"
-    TitleBackground "rgb:2/a/9"
-    TitleForeground "gray85"
-    MenuBackground "rgb:2/a/9"
-    MenuForeground "gray85"
-    MenuTitleBackground "gray70"
-    MenuTitleForeground "rgb:2/a/9"
-    IconBackground "rgb:2/a/9"
-    IconForeground "gray85"
-    IconBorderColor "gray85"
-    IconManagerBackground "rgb:2/a/9"
-    IconManagerForeground "gray85"
-}
-
-Button1 = : root : f.menu "defops"
-Button2 = : root : f.menu "windowops"
-Button3 = : root : f.menu "windowops"
-
-menu "defops"
-{
-    "TWM"       f.title
-    "Iconify"   f.iconify
-    "Resize"    f.resize
-    "Move"      f.move
-    "Raise"     f.raise
-    "Lower"     f.lower
-    ""          f.nop
-    "Focus"     f.focus
-    "Unfocus"   f.unfocus
-    ""          f.nop
-    "Kill"      f.destroy
-}
-
-menu "windowops"
-{
-    "Windows"   f.title
-    "Iconify"   f.iconify
-    "Resize"    f.resize
-    "Move"      f.move
-    "Raise"     f.raise
-    "Lower"     f.lower
-    ""          f.nop
-    "Focus"     f.focus
-    "Unfocus"   f.unfocus
-}
-TWMRC
-
-# Launch TWM (Window Manager) in the background with config
-echo "twm -f /tmp/.twmrc &" >> /tmp/obs-xstartup
-
-# Wait for X server to be ready, then setup OBS configuration
-echo "sleep 3" >> /tmp/obs-xstartup
-echo "/usr/local/bin/setup-scenes.sh &" >> /tmp/obs-xstartup
-echo "sleep 5" >> /tmp/obs-xstartup
-
-# Launch OBS with restart loop
-cat >> /tmp/obs-xstartup << 'OBSLOOP'
-(
-  while true; do
-    echo "[obs-loop] Starting OBS on DISPLAY=${OBS_RENDER_DISPLAY:-:99} at $(date)" >&2
-    DISPLAY="${OBS_RENDER_DISPLAY:-:99}" dbus-launch obs --startstreaming --verbose --disable-shutdown-check OBS_LAUNCH_FLAGS_PLACEHOLDER &
-    OBS_PID=$!
-    wait $OBS_PID
-    echo "[obs-loop] OBS exited with code $? at $(date). Restarting in 5s..." >&2
-    sleep 5
-  done
-) &
-
-# Dedicated window-raiser: polls every 2s and forces OBS window visible whenever found
-(
-  while true; do
-    OBS_WID=$(xdotool search --name "OBS" 2>/dev/null | head -1)
-    if [ -n "$OBS_WID" ]; then
-      xdotool windowmap "$OBS_WID" 2>/dev/null
-      xdotool windowraise "$OBS_WID" 2>/dev/null
-      xdotool windowmove --id "$OBS_WID" 0 0 2>/dev/null
-      xdotool windowsize --id "$OBS_WID" 1280 800 2>/dev/null
-      xdotool windowfocus --id "$OBS_WID" 2>/dev/null
-    fi
-    sleep 2
-  done
-) &
-OBSLOOP
-
-sed -i "s|OBS_LAUNCH_FLAGS_PLACEHOLDER|${OBS_LAUNCH_FLAGS}|" /tmp/obs-xstartup
-
-# Launch xterm in background for debugging (not exec — don't let it steal focus)
-echo "xterm -geometry 100x20+0+900 &" >> /tmp/obs-xstartup
-
-# Keep xstartup alive
-echo "wait" >> /tmp/obs-xstartup
-
-chmod +x /tmp/obs-xstartup
-
-# 2. Start a dedicated software X server for OBS rendering.
-Xvfb :99 -screen 0 1920x1080x24 +extension GLX +extension RENDER >/tmp/xvfb.log 2>&1 &
-export OBS_RENDER_DISPLAY=:99
-until DISPLAY=:99 xdpyinfo >/dev/null 2>&1; do
-    sleep 0.2
+# Give the daemon a moment to settle
+for _ in 1 2 3 4 5; do
+    pactl info >/dev/null 2>&1 && break
+    sleep 1
 done
 
-# 3. Start a separate display for the channel browser so OBS can capture it
-# without recursively capturing its own render display.
-Xvfb :98 -screen 0 1920x1080x24 +extension RANDR +extension MIT-SHM +extension XINERAMA >/tmp/browser-xvfb.log 2>&1 &
-export CHANNEL_RENDER_DISPLAY=:98
-until DISPLAY=:98 xdpyinfo >/dev/null 2>&1; do
+echo "[pulseaudio] Creating null sink 'stream_out'..." >&2
+pactl load-module module-null-sink \
+    sink_name=stream_out \
+    sink_properties=device.description=stream_out \
+    >/dev/null 2>&1 || true
+
+pactl set-default-sink stream_out 2>/dev/null || true
+echo "[pulseaudio] Default sink → stream_out (monitor: stream_out.monitor)" >&2
+
+# ---------------------------------------------------------------------------
+# 2. Xvfb: single virtual display for the browser
+# ---------------------------------------------------------------------------
+echo "[xvfb] Starting Xvfb ${DISPLAY_NUM}..." >&2
+Xvfb "${DISPLAY_NUM}" \
+    -screen 0 "${RESOLUTION}x24" \
+    +extension RANDR \
+    +extension MIT-SHM \
+    +extension XINERAMA \
+    >/tmp/xvfb.log 2>&1 &
+XVFB_PID=$!
+export DISPLAY="${DISPLAY_NUM}"
+
+until xdpyinfo >/dev/null 2>&1; do
     sleep 0.2
 done
+echo "[xvfb] ${DISPLAY_NUM} is ready (PID ${XVFB_PID})" >&2
 
-python3 -m http.server 8787 --directory /tmp >/tmp/obs-http.log 2>&1 &
-until curl -fsS http://127.0.0.1:8787/obs-browser-test.html >/dev/null 2>&1; do
-    sleep 0.2
-done
-
-BROWSER_LOG=/tmp/channel-browser.log
-rm -f "${BROWSER_LOG}"
-
-launch_channel_browser() {
-  case "${CHANNEL_BROWSER}" in
-    chrome)
-      rm -rf /tmp/chrome-profile
-      mkdir -p /tmp/chrome-profile
-      echo "[channel-browser] Starting Google Chrome on ${CHANNEL_RENDER_DISPLAY} at $(date) -> ${CHANNEL_BROWSER_URL}" >&2
-      nohup env \
-        DISPLAY="${CHANNEL_RENDER_DISPLAY}" \
+# ---------------------------------------------------------------------------
+# 3. Chrome: render CHANNEL_BROWSER_URL on the Xvfb display
+# ---------------------------------------------------------------------------
+launch_browser() {
+    rm -rf /tmp/chrome-profile
+    mkdir -p /tmp/chrome-profile
+    echo "[browser] Starting Chrome → ${CHANNEL_BROWSER_URL} on ${DISPLAY_NUM}" >&2
+    env \
+        DISPLAY="${DISPLAY_NUM}" \
         GTK_A11Y=none \
         LIBGL_ALWAYS_SOFTWARE=1 \
         google-chrome \
-        --no-sandbox \
-        --disable-gpu \
-        --disable-dev-shm-usage \
-        --disable-features=Translate,MediaRouter,OptimizationHints,CalculateNativeWinOcclusion,ChromeWhatsNewUI,SigninIntercept,SearchEngineChoiceTrigger \
-        --disable-background-networking \
-        --disable-default-apps \
-        --disable-popup-blocking \
-        --disable-renderer-backgrounding \
-        --disable-session-crashed-bubble \
-        --disable-sync \
-        --guest \
-        --hide-scrollbars \
-        --incognito \
-        --kiosk \
-        --no-default-browser-check \
-        --no-first-run \
-        --test-type \
-        --window-position=0,0 \
-        --window-size=1920,1080 \
-        --autoplay-policy=no-user-gesture-required \
-        --user-data-dir=/tmp/chrome-profile \
-        "${CHANNEL_BROWSER_URL}" \
-        >"${BROWSER_LOG}" 2>&1 &
-      echo $! >/tmp/channel-browser.pid
-      ;;
-    firefox)
-      rm -rf /tmp/firefox-profile
-      mkdir -p /tmp/firefox-profile
-      echo "[channel-browser] Starting Firefox on ${CHANNEL_RENDER_DISPLAY} at $(date) -> ${CHANNEL_BROWSER_URL}" >&2
-      nohup env \
-        DISPLAY="${CHANNEL_RENDER_DISPLAY}" \
-        GTK_A11Y=none \
-        LIBGL_ALWAYS_SOFTWARE=1 \
-        firefox \
-        --no-remote \
-        --new-window \
-        --profile /tmp/firefox-profile \
-        "${CHANNEL_BROWSER_URL}" \
-        >"${BROWSER_LOG}" 2>&1 &
-      echo $! >/tmp/channel-browser.pid
-      ;;
-    epiphany|*)
-      rm -rf /tmp/epiphany-profile
-      mkdir -p /tmp/epiphany-profile
-      echo "[channel-browser] Starting Epiphany on ${CHANNEL_RENDER_DISPLAY} at $(date) -> ${CHANNEL_BROWSER_URL}" >&2
-      nohup env \
-        DISPLAY="${CHANNEL_RENDER_DISPLAY}" \
-        GTK_A11Y=none \
-        LIBGL_ALWAYS_SOFTWARE=1 \
-        WEBKIT_DISABLE_COMPOSITING_MODE=1 \
-        WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 \
-        dbus-run-session -- \
-        epiphany-browser --private-instance --new-window --profile="/tmp/epiphany-profile" "${CHANNEL_BROWSER_URL}" \
-        >"${BROWSER_LOG}" 2>&1 &
-      echo $! >/tmp/channel-browser.pid
-      ;;
-  esac
+            --no-sandbox \
+            --disable-gpu \
+            --disable-dev-shm-usage \
+            --disable-features=Translate,MediaRouter,OptimizationHints,CalculateNativeWinOcclusion,ChromeWhatsNewUI,SigninIntercept,SearchEngineChoiceTrigger \
+            --disable-background-networking \
+            --disable-default-apps \
+            --disable-popup-blocking \
+            --disable-renderer-backgrounding \
+            --disable-session-crashed-bubble \
+            --disable-sync \
+            --hide-scrollbars \
+            --incognito \
+            --kiosk \
+            --no-default-browser-check \
+            --no-first-run \
+            --test-type \
+            --window-position=0,0 \
+            --window-size=1920,1080 \
+            --autoplay-policy=no-user-gesture-required \
+            --user-data-dir=/tmp/chrome-profile \
+            "${CHANNEL_BROWSER_URL}" \
+        >>"${BROWSER_LOG}" 2>&1 &
+    echo $! >"${BROWSER_PID_FILE}"
+    echo "[browser] Chrome started with PID $!" >&2
 }
 
-launch_channel_browser
+launch_browser
 
-# 4. Clean up stale VNC/X11 lock files from previous container runs
-# Without this, vncserver silently fails to start after a container restart
-rm -f /tmp/.X1-lock /tmp/.X11-unix/X1 /tmp/.X0-lock /tmp/.X11-unix/X0
-vncserver -kill :1 2>/dev/null || true
+# Wait for the page to load before starting the stream
+sleep 5
 
-# 5. Start TigerVNC on :1 for debugging and shell access
-/usr/bin/vncserver :1 -geometry 1920x1080 -depth 24 -pixelformat rgb888 -SecurityTypes None -rfbport 5901 -localhost no -xstartup /tmp/obs-xstartup --I-KNOW-THIS-IS-INSECURE &
-export DISPLAY=:1
+# ---------------------------------------------------------------------------
+# 4. ffmpeg: x11grab + PulseAudio → H.264/AAC → RTMPS to YouTube
+#    Supervisor loop: restart on exit, detect stalls, apply backoff
+# ---------------------------------------------------------------------------
+start_ffmpeg() {
+    rm -f "${FFMPEG_PROGRESS}"
+    ffmpeg \
+        -loglevel warning \
+        -f x11grab -video_size "${RESOLUTION}" -framerate "${FPS}" -i "${DISPLAY_NUM}" \
+        -f pulse -i stream_out.monitor \
+        -c:v libx264 \
+        -preset veryfast \
+        -tune zerolatency \
+        -b:v 6000k \
+        -maxrate 6000k \
+        -bufsize 12000k \
+        -g 60 \
+        -keyint_min 60 \
+        -sc_threshold 0 \
+        -c:a aac \
+        -b:a 128k \
+        -ar 44100 \
+        -ac 2 \
+        -f flv \
+        -progress "${FFMPEG_PROGRESS}" \
+        "${YOUTUBE_RTMPS_URL}/${YOUTUBE_STREAM_KEY}" \
+        >>"${FFMPEG_LOG}" 2>&1 &
+    echo $!
+}
 
-# 6. Stream logs to container stdout and keep alive
-echo "Starting VNC server and streaming logs..."
-mkdir -p /config/.vnc /config/.config/obs-studio/logs /config/.config/obs-studio/crashes
-exec sh -c '
-  while true; do
-    echo "[log-stream] --- $(date -Iseconds) ---"
-    for f in /config/.vnc/*.log /config/.config/obs-studio/logs/*.txt /config/.config/obs-studio/crashes/*; do
-      [ -f "$f" ] || continue
-      echo "[log-stream] tailing: $f"
-      tail -n 80 "$f" | sed "s|^|[$(basename $f)] |"
+stall_watchdog() {
+    local pid=$1
+    local last_frame=0
+    local last_advance
+    last_advance=$(date +%s)
+
+    while kill -0 "${pid}" 2>/dev/null; do
+        sleep 5
+        if [ -f "${FFMPEG_PROGRESS}" ]; then
+            local frame
+            frame=$(grep "^frame=" "${FFMPEG_PROGRESS}" 2>/dev/null | tail -1 | cut -d= -f2 | tr -d '[:space:]')
+            if [ -n "${frame}" ] && [ "${frame}" != "${last_frame}" ]; then
+                last_frame="${frame}"
+                last_advance=$(date +%s)
+            fi
+        fi
+        local elapsed=$(( $(date +%s) - last_advance ))
+        if [ "${elapsed}" -ge "${STALL_TIMEOUT}" ]; then
+            echo "[ffmpeg-watch] No frame advance for ${elapsed}s — killing PID ${pid}" >&2
+            kill "${pid}" 2>/dev/null || true
+            return
+        fi
     done
-    echo "[log-stream] ---------------------------"
-    sleep 5
-  done
+}
+
+backoff=${RESTART_BACKOFF}
+(
+    while true; do
+        if [ -z "${YOUTUBE_STREAM_KEY:-}" ]; then
+            echo "[ffmpeg] YOUTUBE_STREAM_KEY is not set; retrying in 30s..." >&2
+            sleep 30
+            continue
+        fi
+
+        echo "[ffmpeg] Starting at $(date)" >&2
+        stream_start=$(date +%s)
+        FFMPEG_PID=$(start_ffmpeg)
+
+        stall_watchdog "${FFMPEG_PID}" &
+        WATCHER_PID=$!
+
+        wait "${FFMPEG_PID}" 2>/dev/null || true
+        EXIT_CODE=$?
+        kill "${WATCHER_PID}" 2>/dev/null || true
+
+        stream_duration=$(( $(date +%s) - stream_start ))
+        echo "[ffmpeg] Exited (code ${EXIT_CODE}) after ${stream_duration}s at $(date)" >&2
+
+        # Reset backoff if the stream ran for more than a minute (healthy run)
+        if [ "${stream_duration}" -ge 60 ]; then
+            backoff=${RESTART_BACKOFF}
+        fi
+
+        echo "[ffmpeg] Restarting in ${backoff}s..." >&2
+        sleep "${backoff}"
+        backoff=$(( backoff * 2 ))
+        [ "${backoff}" -gt "${MAX_BACKOFF}" ] && backoff=${MAX_BACKOFF}
+    done
+) &
+
+# ---------------------------------------------------------------------------
+# 5. Browser watchdog: restart Chrome if it exits unexpectedly
+# ---------------------------------------------------------------------------
+(
+    while true; do
+        sleep 15
+        if [ -f "${BROWSER_PID_FILE}" ]; then
+            BROWSER_PID=$(cat "${BROWSER_PID_FILE}")
+            if ! kill -0 "${BROWSER_PID}" 2>/dev/null; then
+                echo "[browser-watch] Chrome exited — restarting..." >&2
+                launch_browser
+            fi
+        fi
+    done
+) &
+
+# ---------------------------------------------------------------------------
+# 6. Forward logs to container stdout and keep the container alive
+# ---------------------------------------------------------------------------
+echo "[startup] Pipeline running. Tailing logs..." >&2
+exec sh -c '
+    while true; do
+        echo "[log] --- $(date -Iseconds) ---"
+        for f in /tmp/ffmpeg.log /tmp/channel-browser.log /tmp/xvfb.log /tmp/pulseaudio.log; do
+            [ -f "$f" ] || continue
+            echo "[log] === $(basename "$f") ==="
+            tail -n 20 "$f" | sed "s|^|  |"
+        done
+        echo "[log] ---------------------------"
+        sleep 10
+    done
 '

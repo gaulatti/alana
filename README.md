@@ -1,14 +1,21 @@
-# Alana - OBS Docker Environment
+# Alana - Headless Browser Streaming Environment
 
-A containerized OBS Studio environment with obs-websocket support for remote, dynamic control of scenes, sources, transitions, and media.
+A containerized streaming pipeline that renders a React channel webpage in Google Chrome and pushes a live H.264/AAC stream to YouTube via RTMPS — **no OBS required**.
 
-## Features
+## Architecture
 
-- **OBS Studio** with VNC access for visual monitoring
-- **obs-websocket** (built-in with OBS 28+) for remote API control
-- **Dynamic scene management** via obs-websocket commands
-- Support for browser sources, media playlist, and transitions
-- GPU hardware encoding support (Intel QSV)
+```
+Xvfb :98  ──▶  Google Chrome  ──▶  x11grab  ──┐
+                (CHANNEL_BROWSER_URL)           ├──▶  ffmpeg  ──▶  RTMPS  ──▶  YouTube
+PulseAudio null sink (stream_out) ─────────────┘
+```
+
+- **Chrome** renders the channel page (video, audio, WebRTC, overlays — everything comes from the webpage).
+- **Xvfb :98** provides a single virtual display at 1920×1080.
+- **PulseAudio** routes browser audio through a null sink so `ffmpeg` can capture it reliably via the monitor source.
+- **ffmpeg** encodes video (`x11grab`) and audio (`pulse`) to H.264/AAC and streams via RTMPS to YouTube Live.
+- A **supervisor loop** restarts ffmpeg on crash with exponential backoff, and a **stall watchdog** kills and restarts it if no frames are produced for 30 seconds.
+- A **browser watchdog** restarts Chrome if it exits unexpectedly.
 
 ## Quick Start
 
@@ -21,211 +28,98 @@ make build
 ### Run the Container
 
 ```bash
-# Basic run (no authentication - development only)
-make run
-
-# With obs-websocket authentication (recommended for production)
-export OBS_WEBSOCKET_PASSWORD="your_secure_password"
-make run
-
-# With YouTube streaming
 export YOUTUBE_STREAM_KEY="your_stream_key"
-export OBS_WEBSOCKET_PASSWORD="your_secure_password"
 make run
 ```
 
-### Connect to OBS
+Or with a custom channel URL:
 
-- **VNC**: Connect to `localhost:5901` for graphical access
-- **obs-websocket**: Connect to `ws://localhost:4455` for API access
+```bash
+export YOUTUBE_STREAM_KEY="your_stream_key"
+make run CHANNEL_BROWSER_URL="https://your-channel-app.example.com"
+```
+
+### Manual `docker run` (equivalent to `make run`)
+
+```bash
+docker build -t alana:latest . && docker rm -f alana
+docker run -d \
+    --name alana \
+    --restart always \
+    --shm-size=1g \
+    -e YOUTUBE_STREAM_KEY="your_stream_key" \
+    -e CHANNEL_BROWSER_URL="https://your-channel-app.example.com" \
+    alana:latest
+```
+
+> **Note:** OBS-era env vars (`OBS_LEGACY_MODE`, `OBS_WEBSOCKET_PORT`, `OBS_WEBSOCKET_PASSWORD`) and port mappings (`4455`, `5901`) are silently ignored if passed — they are no longer used.
 
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OBS_WEBSOCKET_PASSWORD` | (empty) | Password for obs-websocket authentication. **Set this for production!** |
-| `OBS_WEBSOCKET_PORT` | `4455` | Port for obs-websocket server |
-| `OBS_LEGACY_MODE` | `false` | Set to `true` to enable deprecated static scene import |
-| `YOUTUBE_STREAM_KEY` | (empty) | YouTube RTMP stream key |
+| `YOUTUBE_STREAM_KEY` | (empty) | YouTube Live stream key — **required to stream** |
+| `CHANNEL_BROWSER_URL` | `https://alcantara.gaulatti.com/program/fifthbell` | URL of the React channel page to render |
 
-## obs-websocket API
-
-OBS 28+ includes obs-websocket v5 built-in. The container is configured to:
-
-1. Start obs-websocket server automatically
-2. Listen on port 4455 (configurable via `OBS_WEBSOCKET_PORT`)
-3. Require authentication when `OBS_WEBSOCKET_PASSWORD` is set
-
-### Connecting from External Applications
-
-#### Using obs-websocket-js (Node.js)
-
-```javascript
-import OBSWebSocket from 'obs-websocket-js';
-
-const obs = new OBSWebSocket();
-
-// Connect to OBS
-await obs.connect('ws://localhost:4455', 'your_password');
-
-// Get version info
-const version = await obs.call('GetVersion');
-console.log('OBS Version:', version.obsVersion);
-
-// Create a new scene
-await obs.call('CreateScene', { sceneName: 'MyNewScene' });
-
-// Add a browser source to the scene
-await obs.call('CreateInput', {
-  sceneName: 'MyNewScene',
-  inputName: 'MyBrowser',
-  inputKind: 'browser_source',
-  inputSettings: {
-    url: 'https://example.com',
-    width: 1920,
-    height: 1080
-  }
-});
-
-// Switch to the new scene
-await obs.call('SetCurrentProgramScene', { sceneName: 'MyNewScene' });
-
-// Set a stinger transition
-await obs.call('SetCurrentSceneTransition', { transitionName: 'Stinger' });
-
-// Get list of scenes
-const scenes = await obs.call('GetSceneList');
-console.log('Scenes:', scenes.scenes);
-
-// Delete a scene
-await obs.call('RemoveScene', { sceneName: 'MyNewScene' });
-
-// Disconnect
-obs.disconnect();
-```
-
-#### Using curl (for testing)
-
-obs-websocket v5 uses a binary WebSocket protocol and cannot be easily tested with curl. Use a WebSocket client or obs-websocket-js instead.
-
-### Common obs-websocket Operations
-
-| Operation | Request Type | Example |
-|-----------|--------------|---------|
-| Get scene list | `GetSceneList` | `obs.call('GetSceneList')` |
-| Create scene | `CreateScene` | `obs.call('CreateScene', { sceneName: 'Name' })` |
-| Remove scene | `RemoveScene` | `obs.call('RemoveScene', { sceneName: 'Name' })` |
-| Switch scene | `SetCurrentProgramScene` | `obs.call('SetCurrentProgramScene', { sceneName: 'Name' })` |
-| Add source | `CreateInput` | `obs.call('CreateInput', { sceneName, inputName, inputKind, inputSettings })` |
-| Remove source | `RemoveInput` | `obs.call('RemoveInput', { inputName: 'Name' })` |
-| Get inputs | `GetInputList` | `obs.call('GetInputList')` |
-| Set transition | `SetCurrentSceneTransition` | `obs.call('SetCurrentSceneTransition', { transitionName: 'Fade' })` |
-| Start streaming | `StartStream` | `obs.call('StartStream')` |
-| Stop streaming | `StopStream` | `obs.call('StopStream')` |
-
-For the complete API reference, see the [obs-websocket protocol documentation](https://github.com/obsproject/obs-websocket/blob/master/docs/generated/protocol.md).
-
-## Dynamic Scene Management
-
-By default, OBS starts with a minimal scene collection containing a single blank scene. All scene, source, transition, and media management should be performed via the obs-websocket API.
-
-### Example: Setting Up a Streaming Scene
-
-```javascript
-import OBSWebSocket from 'obs-websocket-js';
-
-const obs = new OBSWebSocket();
-await obs.connect('ws://localhost:4455', 'your_password');
-
-// Create main scene
-await obs.call('CreateScene', { sceneName: 'MainScene' });
-
-// Add a browser source
-await obs.call('CreateInput', {
-  sceneName: 'MainScene',
-  inputName: 'MainBrowser',
-  inputKind: 'browser_source',
-  inputSettings: {
-    url: 'https://your-dashboard.com',
-    width: 1920,
-    height: 1080
-  }
-});
-
-// Add an audio source (media file)
-await obs.call('CreateInput', {
-  sceneName: 'MainScene',
-  inputName: 'BackgroundMusic',
-  inputKind: 'ffmpeg_source',
-  inputSettings: {
-    local_file: '/media/background.mp3',
-    looping: true
-  }
-});
-
-// Set as current scene
-await obs.call('SetCurrentProgramScene', { sceneName: 'MainScene' });
-
-// Start streaming
-await obs.call('StartStream');
-```
-
-## Legacy Mode (Deprecated)
-
-> ⚠️ **DEPRECATED**: Static scene import is deprecated and will be removed in a future release.
-
-For backward compatibility, you can enable legacy mode to import pre-configured scenes from `scenes.json`:
+## Viewing Logs
 
 ```bash
-export OBS_LEGACY_MODE=true
-make run
+make logs
+# or
+docker logs -f alana
 ```
 
-### Deprecated Files
+Log sections surfaced to stdout every 10 seconds:
 
-The following files are kept for legacy support only:
+| Log file | Content |
+|----------|---------|
+| `/tmp/ffmpeg.log` | ffmpeg encode/stream output |
+| `/tmp/channel-browser.log` | Chrome stderr |
+| `/tmp/xvfb.log` | Xvfb virtual display |
+| `/tmp/pulseaudio.log` | PulseAudio daemon |
 
-- `scenes.json` - Pre-configured scene collection (DEPRECATED)
-- `advanced-scene-switcher.json` - Automation macros (DEPRECATED)
+## Resilience
 
-**Recommendation**: Migrate to obs-websocket API for all scene/source/media management.
+| Mechanism | Behaviour |
+|-----------|-----------|
+| ffmpeg supervisor loop | Restarts ffmpeg on exit; backoff starts at 5 s, doubles up to 60 s; resets after a healthy 60 s run |
+| Stall watchdog | Kills ffmpeg if `frame=` in `-progress` output does not advance for 30 s |
+| Browser watchdog | Checks every 15 s; restarts Chrome if the process has exited |
 
-## Ports
-
-| Port | Protocol | Description |
-|------|----------|-------------|
-| 4455 | WebSocket | obs-websocket API for remote control |
-| 5901 | VNC | TigerVNC for graphical access |
-| 9222 | HTTP | CEF remote debugging (browser sources) |
-
-## Volume Mounts
+## Volume Mounts (optional)
 
 | Host Path | Container Path | Description |
 |-----------|----------------|-------------|
-| `./music` | `/media` | Audio files for media sources |
-| `./video` | `/video` | Video files for transitions and media |
-
-## Security Considerations
-
-1. **Always set `OBS_WEBSOCKET_PASSWORD`** in production environments
-2. Use a firewall to restrict access to ports 4455 and 5901
-3. Consider using a reverse proxy with TLS for secure WebSocket connections
-4. The VNC server runs without a password by default - restrict access at the network level
+| `./music` | `/media` | Audio files accessible inside the container |
+| `./video` | `/video` | Video files accessible inside the container |
 
 ## Troubleshooting
 
-### obs-websocket Connection Issues
+### Stream not starting / `YOUTUBE_STREAM_KEY` not set
 
-1. Verify the container is running: `docker ps`
-2. Check logs: `make logs`
-3. Ensure port 4455 is accessible: `nc -zv localhost 4455`
-4. Verify password matches if authentication is enabled
+ffmpeg will log `YOUTUBE_STREAM_KEY is not set` and retry every 30 s. Pass the key via `-e YOUTUBE_STREAM_KEY=...`.
 
-### VNC Connection Issues
+### No audio in stream
 
-1. Ensure port 5901 is accessible
-2. Use a VNC client that supports TigerVNC protocol
-3. No password is required by default
+1. Confirm PulseAudio started: `docker exec alana pactl info`
+2. Check the null sink exists: `docker exec alana pactl list sinks short` — you should see `stream_out`.
+3. Verify Chrome is using the right sink: `docker exec alana pactl list sink-inputs short`.
+4. Check `/tmp/pulseaudio.log` inside the container for errors.
+
+### Black / frozen video
+
+1. Check Chrome is alive: `docker exec alana cat /tmp/channel-browser.pid | xargs kill -0 && echo running`
+2. Check Xvfb: `docker exec alana cat /tmp/xvfb.log`
+3. Verify ffmpeg is capturing: `docker exec alana grep frame= /tmp/ffmpeg-progress.txt`
+
+### Chrome crashes immediately
+
+- Increase `--shm-size` (currently `1g`) if you see shared memory errors in `/tmp/channel-browser.log`.
+- Ensure the host kernel allows user namespaces or that `--no-sandbox` is effective.
+
+### ffmpeg keeps restarting
+
+Check `/tmp/ffmpeg.log` inside the container for the root cause (network, bad stream key, encoding errors).
 
 ## License
 
