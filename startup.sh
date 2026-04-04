@@ -19,6 +19,14 @@ AUDIO_BITRATE="${AUDIO_BITRATE:-128k}"
 VIDEO_ENCODER="${VIDEO_ENCODER:-libx264}"  # libx264 | h264_vaapi
 VAAPI_DEVICE="${VAAPI_DEVICE:-}"
 VAAPI_DRIVER="${VAAPI_DRIVER:-}"
+STREAM_MODE="${STREAM_MODE:-youtube}"  # youtube | icecast
+ICECAST_HOST="${ICECAST_HOST:-localhost}"
+ICECAST_PORT="${ICECAST_PORT:-8000}"
+ICECAST_MOUNT="${ICECAST_MOUNT:-/stream}"
+ICECAST_SOURCE_PASSWORD="${ICECAST_SOURCE_PASSWORD:-hackme}"
+ICECAST_CODEC="${ICECAST_CODEC:-mp3}"  # mp3 | aac | opus
+ICECAST_BITRATE="${ICECAST_BITRATE:-128k}"
+ICECAST_STREAM_NAME="${ICECAST_STREAM_NAME:-Alana Radio}"
 DISABLE_CHROME_GPU="${DISABLE_CHROME_GPU:-0}"
 CHROME_SOFTWARE_GL="${CHROME_SOFTWARE_GL:-0}"
 CHROME_DISABLE_DEV_SHM_USAGE="${CHROME_DISABLE_DEV_SHM_USAGE:-0}"
@@ -245,7 +253,7 @@ stop_ffmpeg_if_running() {
     fi
 
     # Secondary safety net: remove stale duplicate ffmpeg encoders.
-    pgrep -f "ffmpeg .* -i ${DISPLAY_NUM} .*stream_out.monitor" 2>/dev/null | while read -r pid; do
+    pgrep -f "ffmpeg .* stream_out.monitor" 2>/dev/null | while read -r pid; do
         [ -n "${pid}" ] || continue
         kill "${pid}" 2>/dev/null || true
         sleep 0.2
@@ -256,42 +264,110 @@ stop_ffmpeg_if_running() {
 stall_watchdog() {
     local pid=$1
     local last_frame=0
+    local last_time_us=0
     local last_advance
     last_advance=$(date +%s)
 
     while kill -0 "${pid}" 2>/dev/null; do
         sleep 5
         if [ -f "${FFMPEG_PROGRESS}" ]; then
+            # For video streams track frame=; for audio-only streams track out_time_us
             local frame
             frame=$(grep "^frame=" "${FFMPEG_PROGRESS}" 2>/dev/null | tail -1 | cut -d= -f2 | tr -d '[:space:]')
-            if [ -n "${frame}" ] && [ "${frame}" != "${last_frame}" ]; then
-                last_frame="${frame}"
+            local time_us
+            time_us=$(grep "^out_time_us=" "${FFMPEG_PROGRESS}" 2>/dev/null | tail -1 | cut -d= -f2 | tr -d '[:space:]')
+            if { [ -n "${frame}" ] && [ "${frame}" != "${last_frame}" ]; } || \
+               { [ -n "${time_us}" ] && [ "${time_us}" != "${last_time_us}" ] && [ "${time_us}" != "0" ]; }; then
+                last_frame="${frame:-${last_frame}}"
+                last_time_us="${time_us:-${last_time_us}}"
                 last_advance=$(date +%s)
             fi
         fi
         local elapsed=$(( $(date +%s) - last_advance ))
         if [ "${elapsed}" -ge "${STALL_TIMEOUT}" ]; then
-            echo "[ffmpeg-watch] No frame advance for ${elapsed}s — killing PID ${pid}" >&2
+            echo "[ffmpeg-watch] No progress for ${elapsed}s — killing PID ${pid}" >&2
             kill -9 "${pid}" 2>/dev/null || true
             return
         fi
     done
 }
 
+# ---------------------------------------------------------------------------
+# 4b. ffmpeg: PulseAudio only → MP3/AAC/Opus → Icecast
+# ---------------------------------------------------------------------------
+start_ffmpeg_icecast() {
+    local codec="${ICECAST_CODEC:-mp3}"
+    local bitrate="${ICECAST_BITRATE:-128k}"
+    local -a audio_args
+    local content_type
+
+    case "${codec}" in
+        mp3)
+            audio_args=(-c:a libmp3lame -b:a "${bitrate}" -ar 44100 -ac 2 -f mp3)
+            content_type="audio/mpeg"
+            ;;
+        aac)
+            audio_args=(-c:a aac -b:a "${bitrate}" -ar 44100 -ac 2 -f adts)
+            content_type="audio/aac"
+            ;;
+        opus)
+            audio_args=(-c:a libopus -b:a "${bitrate}" -ar 48000 -ac 2 -vbr on -f ogg)
+            content_type="audio/ogg"
+            ;;
+        *)
+            echo "[ffmpeg-icecast] Unknown codec '${codec}', defaulting to mp3" >&2
+            audio_args=(-c:a libmp3lame -b:a "${bitrate}" -ar 44100 -ac 2 -f mp3)
+            content_type="audio/mpeg"
+            ;;
+    esac
+
+    local icecast_uri="icecast://source:${ICECAST_SOURCE_PASSWORD}@${ICECAST_HOST}:${ICECAST_PORT}${ICECAST_MOUNT}"
+    echo "[ffmpeg-icecast] Streaming ${codec}@${bitrate} → ${icecast_uri}" >&2
+
+    rm -f "${FFMPEG_PROGRESS}"
+    ffmpeg \
+        -loglevel "${FFMPEG_LOGLEVEL}" \
+        -thread_queue_size 128 \
+        -f pulse -i stream_out.monitor \
+        "${audio_args[@]}" \
+        -content_type "${content_type}" \
+        -ice_name "${ICECAST_STREAM_NAME}" \
+        -progress "${FFMPEG_PROGRESS}" \
+        "${icecast_uri}" \
+        >>"${FFMPEG_LOG}" 2>&1 &
+    FFMPEG_PID=$!
+    echo "${FFMPEG_PID}" > "${FFMPEG_PID_FILE}"
+}
+
 backoff=${RESTART_BACKOFF}
 ACTIVE_VIDEO_ENCODER="${VIDEO_ENCODER}"
 (
     while true; do
-        if [ -z "${YOUTUBE_STREAM_KEY:-}" ]; then
-            echo "[ffmpeg] YOUTUBE_STREAM_KEY is not set; retrying in 30s..." >&2
-            sleep 30
-            continue
-        fi
+        if [ "${STREAM_MODE}" = "icecast" ]; then
+            # ---- Icecast (audio-only) supervisor ----
+            if [ -z "${ICECAST_SOURCE_PASSWORD:-}" ]; then
+                echo "[ffmpeg-icecast] ICECAST_SOURCE_PASSWORD is not set; retrying in 30s..." >&2
+                sleep 30
+                continue
+            fi
 
-        echo "[ffmpeg] Starting at $(date)" >&2
-        stop_ffmpeg_if_running
-        stream_start=$(date +%s)
-        start_ffmpeg
+            echo "[ffmpeg-icecast] Starting at $(date)" >&2
+            stop_ffmpeg_if_running
+            stream_start=$(date +%s)
+            start_ffmpeg_icecast
+        else
+            # ---- YouTube (video+audio) supervisor ----
+            if [ -z "${YOUTUBE_STREAM_KEY:-}" ]; then
+                echo "[ffmpeg] YOUTUBE_STREAM_KEY is not set; retrying in 30s..." >&2
+                sleep 30
+                continue
+            fi
+
+            echo "[ffmpeg] Starting at $(date)" >&2
+            stop_ffmpeg_if_running
+            stream_start=$(date +%s)
+            start_ffmpeg
+        fi
 
         stall_watchdog "${FFMPEG_PID}" &
         WATCHER_PID=$!
@@ -303,8 +379,10 @@ ACTIVE_VIDEO_ENCODER="${VIDEO_ENCODER}"
         stream_duration=$(( $(date +%s) - stream_start ))
         echo "[ffmpeg] Exited (code ${EXIT_CODE}) after ${stream_duration}s at $(date)" >&2
 
-        # If VAAPI fails immediately, fall back to libx264 automatically.
-        if [ "${ACTIVE_VIDEO_ENCODER}" = "h264_vaapi" ] && [ "${EXIT_CODE}" -ne 0 ] && [ "${stream_duration}" -lt 5 ]; then
+        # If VAAPI fails immediately, fall back to libx264 automatically (YouTube mode only).
+        if [ "${STREAM_MODE}" != "icecast" ] && \
+           [ "${ACTIVE_VIDEO_ENCODER}" = "h264_vaapi" ] && \
+           [ "${EXIT_CODE}" -ne 0 ] && [ "${stream_duration}" -lt 5 ]; then
             echo "[ffmpeg] VAAPI failed quickly; switching to libx264 fallback." >&2
             ACTIVE_VIDEO_ENCODER="libx264"
             backoff=${RESTART_BACKOFF}
