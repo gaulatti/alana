@@ -19,42 +19,56 @@ PulseAudio null sink (stream_out) ─────────────┘
 
 ## Quick Start
 
-### Build the Docker Image
+### Setup
+
+Copy the environment template and fill in your secrets:
 
 ```bash
-make build
+cp .env.example .env
+# Edit .env — at minimum set YOUTUBE_STREAM_KEY and CHANNEL_BROWSER_URL
 ```
 
-### Run the Container
+Keep `.env` out of source control (it's in `.gitignore`).
+
+### Build and Run
 
 ```bash
-export YOUTUBE_STREAM_KEY="your_stream_key"
-make run
+docker compose build
+docker compose up -d
 ```
 
-> Keep `YOUTUBE_STREAM_KEY` out of source control. Use shell environment variables or CI/CD secrets.
+> Equivalent to `docker compose build && docker compose up -d`.
 
-Or with a custom channel URL:
+Or specify variables inline (they override `.env`):
 
 ```bash
-export YOUTUBE_STREAM_KEY="your_stream_key"
-make run CHANNEL_BROWSER_URL="https://your-channel-app.example.com"
+YOUTUBE_STREAM_KEY="your_key" CHANNEL_BROWSER_URL="https://your-app.example.com" docker compose up -d
 ```
 
-### Manual `docker run` (equivalent to `make run`)
+### Direct `docker run` (no compose)
 
 ```bash
-docker build -t alana:latest . && docker rm -f alana
+docker build -t alana:amd64 .
 docker run -d \
     --name alana \
     --restart always \
     --shm-size=1g \
     -e YOUTUBE_STREAM_KEY="your_stream_key" \
     -e CHANNEL_BROWSER_URL="https://your-channel-app.example.com" \
-    alana:latest
+    alana:amd64
 ```
 
-> **Note:** OBS-era env vars (`OBS_LEGACY_MODE`, `OBS_WEBSOCKET_PORT`, `OBS_WEBSOCKET_PASSWORD`) and port mappings (`4455`, `5901`) are silently ignored if passed — they are no longer used.
+### Useful commands
+
+| Action | Command |
+|--------|---------|
+| Build | `docker compose build` |
+| Start | `docker compose up -d` |
+| Stop | `docker compose down` |
+| Restart | `docker compose restart` |
+| Logs (follow) | `docker compose logs -f` |
+| Interactive shell | `docker compose run --rm alana bash` |
+| Clean (remove everything) | `docker compose down --rmi all` |
 
 ## Environment Variables
 
@@ -80,8 +94,7 @@ Xvfb :98  ──▶  Google Chrome (CHANNEL_BROWSER_URL)
 ### Quick Start
 
 ```bash
-make run \
-  STREAM_MODE=icecast \
+STREAM_MODE=icecast \
   CHANNEL_BROWSER_URL="https://your-channel-app.example.com" \
   ICECAST_HOST=your-icecast-server.example.com \
   ICECAST_PORT=8000 \
@@ -89,8 +102,11 @@ make run \
   ICECAST_SOURCE_PASSWORD=your_source_password \
   ICECAST_CODEC=mp3 \
   ICECAST_BITRATE=128k \
-  ICECAST_STREAM_NAME="My Radio Station"
+  ICECAST_STREAM_NAME="My Radio Station" \
+  docker compose up -d
 ```
+
+Or set these in `.env` and just run `docker compose up -d`.
 
 ### Icecast Environment Variables
 
@@ -134,14 +150,21 @@ This profile has been validated for stable YouTube streaming with hardware H.264
 - Target bitrate: `6800k`
 
 ```bash
-make build IMAGE_NAME=alana-v2 CONTAINER_NAME=alana-v2
-make run \
-  IMAGE_NAME=alana-v2 \
-  CONTAINER_NAME=alana-v2 \
-  SHM_SIZE=2g \
+# Set env vars in .env, then:
+docker compose build
+# Uncomment devices: in docker-compose.yml for GPU passthrough
+docker compose up -d
+```
+
+Or with a custom tag and inline overrides:
+
+```bash
+# Build with a custom tag
+docker build -t alana-v2:amd64 .
+# Run with inline env and device passthrough
+IMAGE_NAME=alana-v2 SHM_SIZE=2g \
   YOUTUBE_STREAM_KEY="your_stream_key" \
   CHANNEL_BROWSER_URL="https://example.com/live" \
-  DEVICE_FLAGS="--device=/dev/dri/card0:/dev/dri/card0 --device=/dev/dri/renderD129:/dev/dri/renderD129" \
   VIDEO_ENCODER=h264_vaapi \
   VAAPI_DEVICE=/dev/dri/renderD129 \
   VAAPI_DRIVER=iHD \
@@ -154,7 +177,8 @@ make run \
   GOP_SIZE=60 \
   DRAW_MOUSE=0 \
   CHROME_ENABLE_PERF_FLAGS=0 \
-  CHROME_DISABLE_DEV_SHM_USAGE=0
+  CHROME_DISABLE_DEV_SHM_USAGE=0 \
+  docker compose up -d
 ```
 
 If VAAPI fails on your host, Alana falls back to `libx264` automatically so the stream stays up.
@@ -162,7 +186,7 @@ If VAAPI fails on your host, Alana falls back to `libx264` automatically so the 
 ## Viewing Logs
 
 ```bash
-make logs
+docker compose logs -f
 # or
 docker logs -f alana
 ```
@@ -214,7 +238,7 @@ Check `/tmp/ffmpeg.log` inside the container for the root cause (network, bad st
 
 ## EC2 Sizing Guide
 
-Alana runs entirely inside a Docker container and has no cloud-specific dependencies — it works identically on any Linux host. The guidance below targets AWS EC2 as a representative cloud deployment reference, but the same container images and `make run` commands work on any VM, bare-metal server, or on-premises machine.
+Alana runs entirely inside a Docker container and has no cloud-specific dependencies — it works identically on any Linux host. The guidance below targets AWS EC2 as a representative cloud deployment reference, but the same container images and `docker compose up -d` commands work on any VM, bare-metal server, or on-premises machine.
 
 ---
 

@@ -1,0 +1,48 @@
+services:
+  alana:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: alana:amd64
+    container_name: alana
+    restart: always
+    shm_size: "${SHM_SIZE:-1g}"
+    platform: linux/amd64
+    environment:
+      YOUTUBE_STREAM_KEY: "${YOUTUBE_STREAM_KEY:-}"
+      CHANNEL_BROWSER_URL: "${CHANNEL_BROWSER_URL:-}"
+      RESOLUTION: "${RESOLUTION:-}"
+      WINDOW_SIZE: "${WINDOW_SIZE:-}"
+      FPS: "${FPS:-}"
+      DRAW_MOUSE: "${DRAW_MOUSE:-}"
+      VIDEO_ENCODER: "${VIDEO_ENCODER:-}"
+      VIDEO_BITRATE: "${VIDEO_BITRATE:-}"
+      VIDEO_MAXRATE: "${VIDEO_MAXRATE:-}"
+      VIDEO_BUFSIZE: "${VIDEO_BUFSIZE:-}"
+      X264_PRESET: "${X264_PRESET:-}"
+      GOP_SIZE: "${GOP_SIZE:-}"
+      AUDIO_BITRATE: "${AUDIO_BITRATE:-}"
+      VAAPI_DEVICE: "${VAAPI_DEVICE:-}"
+      VAAPI_DRIVER: "${VAAPI_DRIVER:-}"
+      STREAM_MODE: "${STREAM_MODE:-}"
+      ICECAST_HOST: "${ICECAST_HOST:-}"
+      ICECAST_PORT: "${ICECAST_PORT:-}"
+      ICECAST_MOUNT: "${ICECAST_MOUNT:-}"
+      ICECAST_SOURCE_PASSWORD: "${ICECAST_SOURCE_PASSWORD:-}"
+      ICECAST_CODEC: "${ICECAST_CODEC:-}"
+      ICECAST_BITRATE: "${ICECAST_BITRATE:-}"
+      ICECAST_STREAM_NAME: "${ICECAST_STREAM_NAME:-}"
+      DISABLE_CHROME_GPU: "${DISABLE_CHROME_GPU:-}"
+      CHROME_SOFTWARE_GL: "${CHROME_SOFTWARE_GL:-}"
+      CHROME_DISABLE_DEV_SHM_USAGE: "${CHROME_DISABLE_DEV_SHM_USAGE:-}"
+      CHROME_ENABLE_PERF_FLAGS: "${CHROME_ENABLE_PERF_FLAGS:-}"
+      CHROME_EXTRA_FLAGS: "${CHROME_EXTRA_FLAGS:-}"
+      FFMPEG_LOGLEVEL: "${FFMPEG_LOGLEVEL:-}"
+    ports:
+      - "${CHROME_DEVTOOLS_PORT:-9222}:9222"
+    # Uncomment for GPU passthrough (VAAPI on Linux hosts):
+    # devices:
+    #   - /dev/dri/card0:/dev/dri/card0
+    #   - /dev/dri/renderD129:/dev/dri/renderD129
+    #   # ALSA loopback (audio capture without PulseAudio):
+    #   - /dev/snd:/dev/snd

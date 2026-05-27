@@ -5,3 +5,9 @@ video
 # Node.js
 node_modules/
 package-lock.json
+
+# Environment (contains secrets)
+.env
+
+# Benchmark tools (dev-only)
+bench/

@@ -60,6 +60,10 @@ fi
 # ---------------------------------------------------------------------------
 # 1. PulseAudio: start daemon, create null sink, set as default
 # ---------------------------------------------------------------------------
+# Start dbus system bus so PulseAudio has a functional system bus
+mkdir -p /run/dbus
+dbus-daemon --system --fork 2>/dev/null || true
+
 mkdir -p /tmp/runtime-root && chmod 700 /tmp/runtime-root
 export XDG_RUNTIME_DIR=/tmp/runtime-root
 
@@ -80,6 +84,13 @@ pactl load-module module-null-sink \
 
 pactl set-default-sink stream_out 2>/dev/null || true
 echo "[pulseaudio] Default sink → stream_out (monitor: stream_out.monitor)" >&2
+
+# Resolve PulseAudio socket path explicitly so ffmpeg can always find it
+get_pulseaudio_socket() {
+    pactl info 2>/dev/null | sed -n 's/Server String: //p'
+}
+PULSE_SOCKET=$(get_pulseaudio_socket)
+echo "[pulseaudio] Socket: ${PULSE_SOCKET}" >&2
 
 # ---------------------------------------------------------------------------
 # 2. Xvfb: single virtual display for the browser
@@ -183,6 +194,13 @@ start_ffmpeg() {
 
     if [ -n "${VAAPI_DRIVER}" ]; then
         ffmpeg_env+=(LIBVA_DRIVER_NAME="${VAAPI_DRIVER}")
+    fi
+
+    # Always pass the PulseAudio socket so ffmpeg finds the audio server
+    local pa_socket
+    pa_socket=$(get_pulseaudio_socket)
+    if [ -n "${pa_socket}" ]; then
+        ffmpeg_env+=(PULSE_SERVER="${pa_socket}")
     fi
 
     if [ "${encoder}" = "h264_vaapi" ]; then
@@ -325,7 +343,9 @@ start_ffmpeg_icecast() {
     echo "[ffmpeg-icecast] Streaming ${codec}@${bitrate} → ${icecast_uri}" >&2
 
     rm -f "${FFMPEG_PROGRESS}"
-    ffmpeg \
+    local pa_socket
+    pa_socket=$(get_pulseaudio_socket)
+    env PULSE_SERVER="${pa_socket}" ffmpeg \
         -loglevel "${FFMPEG_LOGLEVEL}" \
         -thread_queue_size 128 \
         -f pulse -i stream_out.monitor \
@@ -417,7 +437,30 @@ ACTIVE_VIDEO_ENCODER="${VIDEO_ENCODER}"
 ) &
 
 # ---------------------------------------------------------------------------
-# 6. Forward logs to container stdout and keep the container alive
+# 6. PulseAudio watchdog: restart daemon and recreate null sink if it dies
+# ---------------------------------------------------------------------------
+ensure_pulseaudio() {
+    if ! pactl info >/dev/null 2>&1; then
+        echo "[pulse-watch] PulseAudio is dead — restarting..." >&2
+        pulseaudio --start --exit-idle-time=-1 --log-target=file:/tmp/pulseaudio.log 2>/dev/null || true
+        sleep 2
+        pactl load-module module-null-sink \
+            sink_name=stream_out \
+            sink_properties=device.description=stream_out \
+            >/dev/null 2>&1 || true
+        pactl set-default-sink stream_out 2>/dev/null || true
+        echo "[pulse-watch] PulseAudio restarted, null sink recreated" >&2
+    fi
+}
+(
+    while true; do
+        sleep 15
+        ensure_pulseaudio
+    done
+) &
+
+# ---------------------------------------------------------------------------
+# 7. Forward logs to container stdout and keep the container alive
 # ---------------------------------------------------------------------------
 echo "[startup] Pipeline running. Tailing logs..." >&2
 exec sh -c '
