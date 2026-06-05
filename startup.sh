@@ -203,6 +203,21 @@ start_ffmpeg() {
         ffmpeg_env+=(PULSE_SERVER="${pa_socket}")
     fi
 
+    if [ "${encoder}" = "h264_nvenc" ]; then
+        echo "[ffmpeg] Using h264_nvenc" >&2
+        video_args=(
+            -c:v h264_nvenc
+            -preset p4
+            -tune ll
+            -b:v "${VIDEO_BITRATE}"
+            -maxrate "${VIDEO_MAXRATE}"
+            -bufsize "${VIDEO_BUFSIZE}"
+            -g "${GOP_SIZE}"
+            -keyint_min "${GOP_SIZE}"
+            -rc vbr
+        )
+    fi
+
     if [ "${encoder}" = "h264_vaapi" ]; then
         if [ -z "${render_node}" ]; then
             render_node=$(ls /dev/dri/renderD* 2>/dev/null | head -n 1)
@@ -360,7 +375,17 @@ start_ffmpeg_icecast() {
 }
 
 backoff=${RESTART_BACKOFF}
-ACTIVE_VIDEO_ENCODER="${VIDEO_ENCODER}"
+case "${GPU_TYPE}" in
+    NVIDIA)
+        ACTIVE_VIDEO_ENCODER="h264_nvenc"
+        ;;
+    INTEL)
+        ACTIVE_VIDEO_ENCODER="h264_vaapi"
+        ;;
+    *)
+        ACTIVE_VIDEO_ENCODER="libx264"
+        ;;
+esac
 (
     while true; do
         if [ "${STREAM_MODE}" = "icecast" ]; then

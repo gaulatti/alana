@@ -4,7 +4,6 @@ services:
       context: .
       dockerfile: Dockerfile
     image: alana:amd64
-    container_name: alana
     restart: always
     shm_size: "${SHM_SIZE:-1g}"
     platform: linux/amd64
@@ -15,15 +14,12 @@ services:
       WINDOW_SIZE: "${WINDOW_SIZE:-}"
       FPS: "${FPS:-}"
       DRAW_MOUSE: "${DRAW_MOUSE:-}"
-      VIDEO_ENCODER: "${VIDEO_ENCODER:-}"
+      GPU_TYPE: "${GPU_TYPE:-}"
       VIDEO_BITRATE: "${VIDEO_BITRATE:-}"
       VIDEO_MAXRATE: "${VIDEO_MAXRATE:-}"
       VIDEO_BUFSIZE: "${VIDEO_BUFSIZE:-}"
-      X264_PRESET: "${X264_PRESET:-}"
       GOP_SIZE: "${GOP_SIZE:-}"
       AUDIO_BITRATE: "${AUDIO_BITRATE:-}"
-      VAAPI_DEVICE: "${VAAPI_DEVICE:-}"
-      VAAPI_DRIVER: "${VAAPI_DRIVER:-}"
       STREAM_MODE: "${STREAM_MODE:-}"
       ICECAST_HOST: "${ICECAST_HOST:-}"
       ICECAST_PORT: "${ICECAST_PORT:-}"
@@ -40,9 +36,27 @@ services:
       FFMPEG_LOGLEVEL: "${FFMPEG_LOGLEVEL:-}"
     ports:
       - "${CHROME_DEVTOOLS_PORT:-9222}:9222"
-    # Uncomment for GPU passthrough (VAAPI on Linux hosts):
-    # devices:
-    #   - /dev/dri/card0:/dev/dri/card0
-    #   - /dev/dri/renderD129:/dev/dri/renderD129
-    #   # ALSA loopback (audio capture without PulseAudio):
-    #   - /dev/snd:/dev/snd
+    profiles:
+      - cpu
+
+  alana-nvidia:
+    extends: alana
+    container_name: alana
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu, video]
+    profiles:
+      - nvidia
+
+  alana-intel:
+    extends: alana
+    container_name: alana
+    devices:
+      - /dev/dri/card0:/dev/dri/card0
+      - /dev/dri/renderD129:/dev/dri/renderD129
+    profiles:
+      - intel
