@@ -1,5 +1,6 @@
-# Use a single, reliable base image
-FROM ubuntu:24.04
+# Debian ships native Chromium builds for amd64 production hosts and arm64
+# developer machines. Native execution is required for realtime capture.
+FROM debian:bookworm-slim
 
 # Set environment variables
 ENV DEBIAN_FRONTEND=noninteractive
@@ -7,29 +8,25 @@ ENV HOME=/config
 WORKDIR /config
 
 # 1. Install core dependencies: X server, PulseAudio, ffmpeg, and Chrome runtime deps
-RUN apt-get update && \
+RUN architecture="$(dpkg --print-architecture)" \
+    && case "${architecture}" in amd64) architecture_packages="intel-media-va-driver" ;; arm64) architecture_packages="" ;; *) echo "Unsupported architecture: ${architecture}" >&2; exit 1 ;; esac \
+    && apt-get update && \
     apt-get install -y --no-install-recommends \
-    # Essential utilities
     ca-certificates \
     curl \
-    wget \
-    # X Server (single virtual display for Chrome)
     xvfb \
     x11-xserver-utils \
     xserver-xorg-core \
     dbus \
     dbus-x11 \
-    # Audio: PulseAudio daemon + control utilities (pactl/pacmd)
     pulseaudio \
     pulseaudio-utils \
-    # Streaming encoder
     ffmpeg \
     vainfo \
     libva2 \
     libva-drm2 \
     mesa-va-drivers \
-    intel-media-va-driver \
-    # Chrome runtime dependencies
+    chromium \
     libnss3 \
     libnspr4 \
     libgbm1 \
@@ -53,28 +50,38 @@ RUN apt-get update && \
     libcairo-gobject2 \
     libgdk-pixbuf-2.0-0 \
     libgtk-3-0 \
-    libasound2t64 \
-    # Fonts for proper webpage rendering
+    libasound2 \
     fonts-noto-core \
     fonts-noto-cjk \
     fontconfig \
+    ${architecture_packages} \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. Install Google Chrome (required for rendering the channel webpage)
-RUN apt-get update \
-    && wget -O /tmp/google-chrome-stable_current_amd64.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
-    && apt-get install -y /tmp/google-chrome-stable_current_amd64.deb \
-    && rm -f /tmp/google-chrome-stable_current_amd64.deb \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+# Used by the optional LiveKit leg to publish ffmpeg's H.264/Opus socket outputs
+# directly to a LiveKit room as a normal WebRTC participant.
+ARG LIVEKIT_CLI_VERSION=2.18.2
+RUN architecture="$(dpkg --print-architecture)" \
+    && case "${architecture}" in amd64) lk_arch=amd64 ;; arm64) lk_arch=arm64 ;; *) echo "Unsupported architecture: ${architecture}" >&2; exit 1 ;; esac \
+    && archive="lk_${LIVEKIT_CLI_VERSION}_linux_${lk_arch}.tar.gz" \
+    && release="https://github.com/livekit/livekit-cli/releases/download/v${LIVEKIT_CLI_VERSION}" \
+    && curl --http1.1 --retry 5 --retry-all-errors -fsSL "${release}/${archive}" -o "/tmp/${archive}" \
+    && curl --http1.1 --retry 5 --retry-all-errors -fsSL "${release}/checksums.txt" -o /tmp/livekit-checksums.txt \
+    && expected="$(awk -v archive="${archive}" '$2 == archive {print $1}' /tmp/livekit-checksums.txt)" \
+    && [ -n "${expected}" ] \
+    && echo "${expected}  /tmp/${archive}" | sha256sum -c - \
+    && tar -xzf "/tmp/${archive}" -C /usr/local/bin lk \
+    && chmod +x /usr/local/bin/lk \
+    && rm -f "/tmp/${archive}" /tmp/livekit-checksums.txt
 
-# Add startup script
-COPY startup.sh /usr/local/bin/
-RUN chmod +x /usr/local/bin/startup.sh
+# Add runtime scripts
+COPY startup.sh validate-config.sh healthcheck.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/startup.sh /usr/local/bin/validate-config.sh /usr/local/bin/healthcheck.sh
 
 # Expose Chrome DevTools remote debugging port
 EXPOSE 9222
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=45s --retries=3 CMD ["/usr/local/bin/healthcheck.sh"]
 
 # Set the entrypoint to the startup script
 ENTRYPOINT ["/usr/local/bin/startup.sh"]

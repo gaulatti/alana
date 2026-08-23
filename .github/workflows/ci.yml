@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install contract dependencies
+        run: sudo apt-get update && sudo apt-get install -y shellcheck ripgrep
+      - name: Check runtime contract
+        run: |
+          shellcheck startup.sh validate-config.sh healthcheck.sh test/runtime-contract.sh
+          bash test/runtime-contract.sh
+
+  images:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Build native runtime
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
