@@ -13,8 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install shellcheck
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Install contract dependencies
+        run: sudo apt-get update && sudo apt-get install -y shellcheck ripgrep
       - name: Check runtime contract
         run: |
           shellcheck startup.sh validate-config.sh healthcheck.sh test/runtime-contract.sh
