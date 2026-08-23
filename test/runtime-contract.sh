@@ -42,7 +42,7 @@ fi
 rg -q 'rtmp_supervisor.*&.*background_pids' startup.sh
 rg -q 'livekit_supervisor.*&.*background_pids' startup.sh
 rg -q 'LIVEKIT_ENABLED.*!= 1' startup.sh
-rg -q '^set +e$' startup.sh
+rg -Fqx 'set +e' startup.sh
 rg -q '/tmp/rtmp-\*\.pid' healthcheck.sh
 rg -q 'ffmpeg .* -loglevel quiet' startup.sh
 if rg -n 'rtmp-.*\.log|livekit-publisher\.log|channel-browser\.log' startup.sh; then
