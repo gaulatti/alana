@@ -48,7 +48,7 @@ background_pids=()
 stop_pid_file() {
     [ -s "$1" ] || return 0
     pid=$(cat "$1" 2>/dev/null || true)
-    [ -n "${pid}" ] && kill "${pid}" 2>/dev/null || true
+    if [ -n "${pid}" ]; then kill "${pid}" 2>/dev/null || true; fi
     unlink "$1" 2>/dev/null || true
 }
 cleanup() {
