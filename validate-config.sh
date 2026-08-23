@@ -8,6 +8,15 @@ fail() {
 
 [ -n "${PROGRAM_ID:-}" ] || fail "PROGRAM_ID is required"
 [ -n "${CHANNEL_BROWSER_URL:-}" ] || fail "CHANNEL_BROWSER_URL is required"
+[ -n "${CROCCANTE_CONTROL_URL:-}" ] || fail "CROCCANTE_CONTROL_URL is required"
+
+case "${CROCCANTE_CONTROL_URL}" in
+    http://*|https://*) ;;
+    *) fail "CROCCANTE_CONTROL_URL must use http or https" ;;
+esac
+case "${CROCCANTE_CONTROL_URL}" in
+    *@*|*\?*|*\#*) fail "CROCCANTE_CONTROL_URL must not contain credentials, query, or fragment" ;;
+esac
 
 if [ -z "${RTMP_OUTPUTS:-}" ] && [ -z "${YOUTUBE_STREAM_KEY:-}" ]; then
     fail "RTMP_OUTPUTS or YOUTUBE_STREAM_KEY is required"
@@ -25,9 +34,15 @@ if [ "${LIVEKIT_ENABLED:-0}" = "1" ]; then
     [ -n "${LIVEKIT_ROOM:-}" ] || fail "LIVEKIT_ROOM is required when LiveKit is enabled"
 fi
 
-for name in STALL_TIMEOUT RESTART_BACKOFF MAX_BACKOFF HEALTHY_RESET_SECONDS; do
+for name in STALL_TIMEOUT RESTART_BACKOFF MAX_BACKOFF HEALTHY_RESET_SECONDS PIPELINE_READY_TIMEOUT CONTROL_RETRY_SECONDS; do
     value="${!name:-}"
     [[ "${value}" =~ ^[1-9][0-9]*$ ]] || fail "${name} must be a positive integer"
+done
+
+for name in ALANA_CONTROL_TOKEN_FILE CROCCANTE_CONTROL_TOKEN_FILE; do
+    path="${!name:-}"
+    [ -n "${path}" ] || fail "${name} is required"
+    [ -s "${path}" ] || fail "${name} must reference a readable non-empty file"
 done
 
 case "${ALLOW_SOFTWARE_FALLBACK:-0}" in

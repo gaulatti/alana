@@ -1,12 +1,17 @@
 # Alana
 
-Alana is Alcantara's headless Program renderer and publisher. One runtime renders
-one configured Alcantara Program page continuously and publishes it through:
+Alana is Alcantara's headless Program renderer and publisher. One runtime owns
+one configured Alcantara Program and publishes it through:
 
 - one or more required RTMP outputs; and
 - an optional concurrent low-latency LiveKit Program feed.
 
 Radio is intentionally absent. Palazzo owns radio playback and Icecast output.
+
+Alana is lifecycle-controlled: it does not render or publish until an
+authenticated Start command is accepted. It acknowledges Start only after the
+local pipeline is ready and Croccante has acknowledged its matching session;
+Stop is acknowledged by Croccante before Alana tears down local output.
 
 ## Architecture
 
@@ -38,6 +43,9 @@ Required:
 | `PROGRAM_ID` | Stable Alcantara program identity for this runtime |
 | `CHANNEL_BROWSER_URL` | Canonical Alcantara Program renderer URL |
 | `RTMP_OUTPUTS` | Full publish URLs separated by spaces, commas, or newlines |
+| `CROCCANTE_CONTROL_URL` | Private Croccante control origin, normally `http://croccante:8081` |
+| `ALANA_CONTROL_TOKEN_FILE` | Host path to the inbound bearer-token file for Compose |
+| `CROCCANTE_CONTROL_TOKEN_FILE` | Host path to Croccante's bearer-token file for Compose |
 
 `YOUTUBE_STREAM_KEY` remains a compatibility input when `RTMP_OUTPUTS` is
 empty. It resolves to YouTube's RTMP ingest URL. Full output URLs and stream keys
@@ -46,6 +54,42 @@ are never printed by Alana's supervisor.
 Chromium, FFmpeg, and LiveKit child-process diagnostics are discarded because
 those tools can repeat connection URLs on failure. Alana emits only indexed
 health and restart telemetry, never renderer URLs or publishing credentials.
+
+## Broadcast lifecycle API
+
+The private API listens on container port 8080 and is deliberately not
+published by the supplied Compose stack. Both services share an external
+`broadcast-control` network:
+
+```bash
+docker network create broadcast-control
+mkdir -p secrets
+openssl rand -hex 32 > secrets/alana-control-token
+# Put Croccante's separately generated token in secrets/croccante-control-token.
+```
+
+Every request uses `Authorization: Bearer <token>`. Mutating requests also need
+a stable `Idempotency-Key` and a positive, monotonically increasing
+`X-Command-Sequence`:
+
+| Method | Private path | Meaning |
+| --- | --- | --- |
+| `GET` | `/v1/programs/{programId}/lifecycle` | Requested/actual state, readiness, active program, timestamps, last command, output health, and Croccante acknowledgement |
+| `POST` | `/v1/programs/{programId}/lifecycle/start` | Ready local output, then request Croccante Start |
+| `POST` | `/v1/programs/{programId}/lifecycle/stop` | Request Croccante Stop, then tear down local output |
+
+Commands for another program return 404. Replayed keys return their original
+result without repeating side effects; old sequences and concurrent transitions
+return 409. Token values, publish URLs, and raw idempotency keys are never stored
+in lifecycle state or emitted by the control server.
+
+The persisted state machine is `stopped -> starting -> running -> stopping ->
+stopped`, with `degraded` or `failed` representing recoverable faults. A failed
+Croccante Stop leaves Alana publishing and retries the same downstream command;
+it never falsely acknowledges Stop. A local publisher failure does not issue a
+Croccante Stop: Alana marks itself degraded and restarts the requested pipeline.
+After container restart, `/var/lib/alana/lifecycle.json` restores the requested
+state and reconciliation resumes. Only one transition is serialized at a time.
 
 Optional LiveKit:
 
@@ -90,7 +134,8 @@ been measured within CPU capacity; the supervisor logs that explicit fallback.
 
 ```bash
 cp .env.example .env
-# Set PROGRAM_ID, CHANNEL_BROWSER_URL, and RTMP_OUTPUTS.
+# Set the renderer, publisher, control URL, and secret-file paths.
+docker network create broadcast-control 2>/dev/null || true
 docker compose up --build
 ```
 
@@ -113,7 +158,8 @@ The root Compose stack is the supported entry point. Use the `alana-intel` or
 
 ## Health and recovery
 
-The image health check requires:
+The image health check considers an explicitly stopped lifecycle healthy. A
+running lifecycle requires:
 
 - the configured Chromium process;
 - one live encoder PID for every RTMP output; and
@@ -133,6 +179,10 @@ as running. Useful files:
 Backoff doubles to the configured cap and resets after sustained health.
 Stalled encoders are killed and restarted. Browser failure restarts only
 Chromium. LiveKit failure leaves every RTMP encoder untouched.
+
+`PIPELINE_READY_TIMEOUT` controls how long Start waits for browser and publisher
+readiness (default 90 seconds). `CONTROL_RETRY_SECONDS` controls reconciliation
+and failed-ack retry cadence (default 5 seconds).
 
 ## Platform builds
 

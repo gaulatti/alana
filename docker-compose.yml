@@ -32,6 +32,11 @@ x-alana-env: &alana-env
   MAX_BACKOFF: "${MAX_BACKOFF:-60}"
   HEALTHY_RESET_SECONDS: "${HEALTHY_RESET_SECONDS:-60}"
   ALLOW_SOFTWARE_FALLBACK: "${ALLOW_SOFTWARE_FALLBACK:-0}"
+  CROCCANTE_CONTROL_URL: "${CROCCANTE_CONTROL_URL:-}"
+  ALANA_CONTROL_TOKEN_FILE: /run/secrets/alana-control-token
+  CROCCANTE_CONTROL_TOKEN_FILE: /run/secrets/croccante-control-token
+  PIPELINE_READY_TIMEOUT: "${PIPELINE_READY_TIMEOUT:-90}"
+  CONTROL_RETRY_SECONDS: "${CONTROL_RETRY_SECONDS:-5}"
 
 x-alana-base: &alana-base
   build:
@@ -45,6 +50,14 @@ x-alana-base: &alana-base
     <<: *alana-env
   ports:
     - "${CHROME_DEVTOOLS_PORT:-9222}:9222"
+  volumes:
+    - alana_state:/var/lib/alana
+  secrets:
+    - alana-control-token
+    - croccante-control-token
+  networks:
+    - default
+    - broadcast-control
 
 services:
   alana:
@@ -80,3 +93,16 @@ services:
       - /dev/dri/renderD129:/dev/dri/renderD129
     profiles:
       - intel
+
+volumes:
+  alana_state:
+
+secrets:
+  alana-control-token:
+    file: "${ALANA_CONTROL_TOKEN_FILE:-./secrets/alana-control-token}"
+  croccante-control-token:
+    file: "${CROCCANTE_CONTROL_TOKEN_FILE:-./secrets/croccante-control-token}"
+
+networks:
+  broadcast-control:
+    external: true

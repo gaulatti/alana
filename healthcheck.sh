@@ -1,6 +1,14 @@
 #!/bin/bash
 set -euo pipefail
 
+state_file="${ALANA_STATE_DIR:-/var/lib/alana}/lifecycle.json"
+[ -s "${state_file}" ] || exit 1
+actual_state=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["actualState"])' "${state_file}")
+if [ "${actual_state}" = stopped ]; then
+    exit 0
+fi
+[ "${actual_state}" = running ] || exit 1
+
 alive_from_file() {
     local path=$1
     [ -s "${path}" ] || return 1
