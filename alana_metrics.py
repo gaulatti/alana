@@ -16,14 +16,17 @@ from typing import Iterator
 
 
 HISTOGRAM_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120)
-HTTP_METHODS = frozenset({"GET", "POST", "OTHER"})
-HTTP_ROUTES = frozenset({"metrics", "lifecycle", "unknown"})
+HTTP_METHODS = frozenset({"GET", "POST", "PUT", "OTHER"})
+HTTP_ROUTES = frozenset({"metrics", "lifecycle", "filler", "unknown"})
 STATUS_CLASSES = frozenset({"1xx", "2xx", "3xx", "4xx", "5xx", "unknown"})
-DEPENDENCY_OPERATIONS = frozenset({"start", "stop"})
+DEPENDENCY_OPERATIONS = frozenset({"start", "stop", "prepare", "filler_status"})
 DEPENDENCY_RESULTS = frozenset({"success", "http_error", "unavailable", "invalid_response", "unexpected_state", "token_unavailable"})
 COMMAND_ACTIONS = frozenset({"start", "stop"})
 COMMAND_RESULTS = frozenset({"success", "conflict", "dependency_failure", "not_ready", "failure"})
 RECONCILE_RESULTS = frozenset({"success", "failure"})
+PREPARATION_RESULTS = frozenset(
+    {"success", "failure", "conflict", "unavailable", "duplicate", "reconciled", "not_ready"}
+)
 LIFECYCLE_STATES = ("stopped", "starting", "running", "stopping", "degraded", "failed", "transitioning", "unknown")
 RUNTIME_LEGS = frozenset({"browser", "audio", "rtmp", "livekit"})
 RESTART_REASONS = frozenset({"watchdog", "exit", "stall", "encoder_unavailable"})
@@ -168,6 +171,13 @@ class Metrics:
     def observe_reconcile(self, result: str) -> None:
         self._increment("alana_reconcile_cycles_total", {"result": result}, {"result": RECONCILE_RESULTS})
 
+    def observe_preparation(self, result: str) -> None:
+        self._increment(
+            "alana_filler_preparations_total",
+            {"result": result},
+            {"result": PREPARATION_RESULTS},
+        )
+
     @staticmethod
     def _gauge(lines: list[str], name: str, help_text: str, value: float | int, labels: dict[str, str] | None = None) -> None:
         lines.extend((f"# HELP {name} {help_text}", f"# TYPE {name} gauge", f"{name}{_labels(labels or {})} {value}"))
@@ -205,6 +215,7 @@ class Metrics:
             "alana_dependency_operations_total": "Croccante control operations by bounded outcome.",
             "alana_lifecycle_commands_total": "Lifecycle commands by bounded action and result.",
             "alana_reconcile_cycles_total": "Lifecycle reconciliation cycles by result.",
+            "alana_filler_preparations_total": "Filler preparation and reconciliation outcomes.",
         }
         for (name, label_pairs), value in sorted(counters.items()):
             lines.extend((f"# HELP {name} {counter_help[name]}", f"# TYPE {name} counter", f"{name}{_labels(dict(label_pairs))} {value}"))
@@ -228,6 +239,16 @@ class Metrics:
         self._gauge(lines, "alana_livekit_enabled", "Whether the LiveKit output is configured.", int(bool(snapshot.get("livekitEnabled"))))
         livekit_healthy = snapshot.get("livekitHealthy")
         self._gauge(lines, "alana_livekit_healthy", "Whether the configured LiveKit output is healthy.", int(bool(livekit_healthy)))
+        active_filler = snapshot.get("activeFiller")
+        pending_filler = snapshot.get("pendingFiller")
+        self._gauge(lines, "alana_filler_active", "Whether the current session is bound to a filler version.", int(isinstance(active_filler, dict)))
+        self._gauge(lines, "alana_filler_pending", "Whether a next-session filler version is configured.", int(isinstance(pending_filler, dict)))
+        self._gauge(
+            lines,
+            "alana_filler_pending_ready",
+            "Whether the configured next-session filler version is acknowledged ready.",
+            int(isinstance(pending_filler, dict) and pending_filler.get("ready") is True),
+        )
 
         with _runtime_lock(self.runtime_path):
             runtime = _read_runtime_state(self.runtime_path)

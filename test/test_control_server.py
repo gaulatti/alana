@@ -4,6 +4,7 @@ import os
 import tempfile
 import threading
 import unittest
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -43,15 +44,42 @@ class FakePipeline:
 
 
 class FakeCroccante:
-    def __init__(self, events, answers=None):
+    def __init__(self, events, answers=None, prepare_answers=None, status_answers=None):
         self.events = events
         self.answers = list(answers or [])
+        self.prepare_answers = list(prepare_answers or [])
+        self.status_answers = list(status_answers or [])
 
-    def command(self, action, key, sequence):
+    def command(self, action, key, sequence, filler_version=None):
         self.events.append(f"croccante:{action}")
         if self.answers:
             return self.answers.pop(0)
-        return {"accepted": True, "requestedState": f"{action}ed"}
+        return {
+            "accepted": True,
+            "requestedState": f"{action}ed",
+            **({"fillerVersion": filler_version} if action == "start" else {}),
+        }
+
+    def prepare(self, version, key, payload):
+        self.events.append(f"croccante:prepare:{version}")
+        if self.prepare_answers:
+            return self.prepare_answers.pop(0)
+        return 200, {
+            "version": version,
+            "status": "ready",
+            "ready": True,
+            "sourceId": payload["source"]["id"],
+            "sourceSha256": payload["source"]["sha256"],
+            "artifactSha256": "b" * 64,
+            "profile": payload["profile"],
+            "preparedAt": "2026-08-24T00:00:00Z",
+        }
+
+    def filler_status(self, version):
+        self.events.append(f"croccante:status:{version}")
+        if self.status_answers:
+            return self.status_answers.pop(0)
+        return 200, {"version": version, "status": "ready", "ready": True}
 
 
 class LifecycleTests(unittest.TestCase):
@@ -70,9 +98,38 @@ class LifecycleTests(unittest.TestCase):
             ready_timeout=1,
             start_monitor=False,
         )
+        self.manager.state["pendingFiller"] = {
+            "version": "filler-v1",
+            "status": "ready",
+            "ready": True,
+            "configurationDigest": "fixture",
+        }
+        self.manager._save()
 
     def tearDown(self):
         self.temp.cleanup()
+
+    @staticmethod
+    def filler_payload(command="prepare-one", source="source-one"):
+        return {
+            "commandId": command,
+            "source": {
+                "id": source,
+                "sha256": "a" * 64,
+                "downloadUrl": "https://signed.example/private?token=never-store",
+            },
+            "profile": {
+                "width": 1920,
+                "height": 1080,
+                "fps": 30,
+                "videoBitrate": "6000k",
+                "audioRate": 48000,
+                "audioChannels": 2,
+                "audioBitrate": "160k",
+                "gop": 60,
+                "loopSeconds": 10,
+            },
+        }
 
     def test_start_waits_for_pipeline_before_croccante(self):
         status, body = self.manager.command("start", "start-one", 1)
@@ -80,6 +137,8 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(self.events, ["pipeline:start", "croccante:start"])
         self.assertEqual(body["actualState"], "running")
         self.assertTrue(body["readiness"])
+        self.assertEqual(body["activeFiller"]["version"], "filler-v1")
+        self.assertIsNone(body["pendingFiller"])
 
     def test_stop_acknowledgement_precedes_pipeline_teardown(self):
         self.manager.command("start", "start-one", 1)
@@ -97,6 +156,88 @@ class LifecycleTests(unittest.TestCase):
         self.assertTrue(duplicate[1]["commandResult"]["duplicate"])
         self.assertEqual(self.events.count("pipeline:start"), 1)
         self.assertEqual(self.events.count("croccante:start"), 1)
+
+    def test_start_fails_closed_until_exact_filler_is_ready(self):
+        self.manager.state["pendingFiller"] = {
+            "version": "filler-v2",
+            "status": "preparing",
+            "ready": False,
+        }
+        status, body = self.manager.command("start", "start-unready", 1)
+        self.assertEqual(status, 409)
+        self.assertEqual(body["commandResult"]["result"], "filler-not-ready")
+        self.assertEqual(self.events, [])
+
+    def test_prepare_is_idempotent_and_precedes_bound_start(self):
+        self.manager.state["pendingFiller"] = None
+        payload = self.filler_payload()
+        first = self.manager.prepare_filler("filler-v2", "prepare-one", payload)
+        duplicate = self.manager.prepare_filler("filler-v2", "prepare-one", payload)
+        self.assertEqual(first[0], 200)
+        self.assertEqual(duplicate[0], 200)
+        self.assertTrue(duplicate[1]["duplicate"])
+        self.assertEqual(self.events, ["croccante:prepare:filler-v2"])
+        status, body = self.manager.command("start", "start-two", 1)
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            self.events,
+            ["croccante:prepare:filler-v2", "pipeline:start", "croccante:start"],
+        )
+        self.assertEqual(body["croccanteAcknowledgement"]["fillerVersion"], "filler-v2")
+
+    def test_version_conflict_is_rejected_without_downstream_side_effect(self):
+        self.manager.state["pendingFiller"] = None
+        self.manager.prepare_filler("filler-v2", "prepare-one", self.filler_payload())
+        changed = self.filler_payload(command="prepare-two", source="source-two")
+        status, body = self.manager.prepare_filler("filler-v2", "prepare-two", changed)
+        self.assertEqual(status, 409)
+        self.assertEqual(body["reason"], "version-conflict")
+        self.assertEqual(self.events.count("croccante:prepare:filler-v2"), 1)
+
+    def test_active_filler_is_immutable_while_next_version_prepares(self):
+        self.manager.command("start", "start-one", 1)
+        payload = self.filler_payload(command="prepare-two", source="source-two")
+        status, _ = self.manager.prepare_filler("filler-v2", "prepare-two", payload)
+        self.assertEqual(status, 200)
+        view = self.manager.view()
+        self.assertEqual(view["activeFiller"]["version"], "filler-v1")
+        self.assertEqual(view["pendingFiller"]["version"], "filler-v2")
+        self.manager.command("stop", "stop-one", 2)
+        view = self.manager.view()
+        self.assertIsNone(view["activeFiller"])
+        self.assertEqual(view["pendingFiller"]["version"], "filler-v2")
+
+    def test_failed_preparation_is_visible_and_retryable(self):
+        self.manager.state["pendingFiller"] = None
+        self.croccante.prepare_answers = [
+            (502, {"version": "filler-v2", "status": "failed", "ready": False, "error": "unavailable-or-invalid-response"}),
+            (200, {"version": "filler-v2", "status": "ready", "ready": True}),
+        ]
+        payload = self.filler_payload()
+        first = self.manager.prepare_filler("filler-v2", "prepare-one", payload)
+        second = self.manager.prepare_filler("filler-v2", "prepare-one", payload)
+        self.assertEqual(first[0], 502)
+        self.assertEqual(second[0], 200)
+        self.assertEqual(self.events.count("croccante:prepare:filler-v2"), 2)
+
+    def test_restart_reconciles_pending_preparation_without_download_material(self):
+        self.manager.state["pendingFiller"] = {
+            "version": "filler-v2",
+            "status": "failed",
+            "ready": False,
+            "configurationDigest": "safe-digest",
+        }
+        self.manager._save()
+        recovered_events = []
+        recovered = control.LifecycleManager(
+            self.store,
+            FakePipeline(recovered_events),
+            FakeCroccante(recovered_events),
+            start_monitor=False,
+        )
+        recovered.reconcile_once()
+        self.assertEqual(recovered_events, ["croccante:status:filler-v2"])
+        self.assertTrue(recovered.view()["pendingFiller"]["ready"])
 
     def test_reused_key_for_different_command_is_rejected(self):
         self.manager.command("start", "same-key", 1)
@@ -166,17 +307,23 @@ class LifecycleTests(unittest.TestCase):
     def test_state_and_command_records_never_store_key_or_token(self):
         secret = "never-persist-this-secret"
         self.manager.command("start", secret, 1)
+        self.manager.prepare_filler("filler-v2", "prepare-two", self.filler_payload(command="prepare-two"))
         persisted = "".join(
             path.read_text() for path in Path(self.temp.name).rglob("*.json")
         )
         self.assertNotIn(secret, persisted)
         self.assertNotIn(secret, json.dumps(self.manager.view()))
+        self.assertNotIn("token=never-store", persisted)
+        self.assertNotIn("downloadUrl", persisted)
 
     def test_public_state_redacts_pending_downstream_key(self):
         self.croccante.answers = [{"accepted": False, "error": "unavailable"}]
         self.manager.command("start", "start-secret", 1)
         pending = self.manager.view()["pendingCroccante"]
-        self.assertEqual(pending, {"action": "start", "sequence": 1})
+        self.assertEqual(
+            pending,
+            {"action": "start", "sequence": 1, "fillerVersion": "filler-v1"},
+        )
 
     def test_http_api_requires_authentication_and_program_scope(self):
         token_file = Path(self.temp.name) / "control-token"
@@ -199,6 +346,40 @@ class LifecycleTests(unittest.TestCase):
             )
             with urlopen(request) as response:
                 self.assertEqual(response.status, 200)
+
+            filler_body = json.dumps(self.filler_payload()).encode()
+            unauthorized_filler = Request(
+                f"{origin}{control.FILLER_PATH}filler-v2",
+                method="PUT",
+                data=filler_body,
+                headers={"Idempotency-Key": "prepare-one"},
+            )
+            with self.assertRaises(HTTPError) as unauthorized:
+                urlopen(unauthorized_filler)
+            self.assertEqual(unauthorized.exception.code, 401)
+            unauthorized.exception.close()
+
+            prepare = Request(
+                f"{origin}{control.FILLER_PATH}filler-v2",
+                method="PUT",
+                data=filler_body,
+                headers={
+                    "Authorization": "Bearer api-secret",
+                    "Content-Type": "application/json",
+                    "Idempotency-Key": "prepare-one",
+                },
+            )
+            with urlopen(prepare) as response:
+                prepared = json.loads(response.read())
+            self.assertTrue(prepared["ready"])
+            self.assertNotIn("downloadUrl", json.dumps(prepared))
+
+            filler_status = Request(
+                f"{origin}{control.FILLER_PATH}filler-v2",
+                headers={"Authorization": "Bearer api-secret"},
+            )
+            with urlopen(filler_status) as response:
+                self.assertTrue(json.loads(response.read())["ready"])
 
             with self.assertRaises(HTTPError) as unauthorized_metrics:
                 urlopen(f"{origin}{control.METRICS_PATH}")
@@ -229,10 +410,124 @@ class LifecycleTests(unittest.TestCase):
                 urlopen(wrong)
             self.assertEqual(not_found.exception.code, 404)
             not_found.exception.close()
+
+            wrong_filler = Request(
+                f"{origin}/v1/programs/not-this-program/fillers/filler-v3",
+                method="PUT",
+                data=filler_body,
+                headers={
+                    "Authorization": "Bearer api-secret",
+                    "Content-Type": "application/json",
+                    "Idempotency-Key": "prepare-one",
+                },
+            )
+            with self.assertRaises(HTTPError) as not_found:
+                urlopen(wrong_filler)
+            self.assertEqual(not_found.exception.code, 404)
+            not_found.exception.close()
         finally:
             server.shutdown()
             server.server_close()
             thread.join()
+
+
+class CroccanteClientContractTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.token_file = Path(self.temp.name) / "croccante-token"
+        self.token_file.write_text("outbound-secret\n")
+        self.requests = []
+        requests = self.requests
+
+        class DownstreamHandler(BaseHTTPRequestHandler):
+            def log_message(self, _format, *_args):
+                return
+
+            def send_payload(self, payload):
+                body = json.dumps(payload).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_PUT(self):
+                length = int(self.headers["Content-Length"])
+                payload = json.loads(self.rfile.read(length))
+                requests.append(("PUT", self.path, dict(self.headers), payload))
+                self.send_payload(
+                    {
+                        "version": "filler-v9",
+                        "status": "ready",
+                        "ready": True,
+                        "sourceId": payload["source"]["id"],
+                        "sourceSha256": payload["source"]["sha256"],
+                        "artifactSha256": "b" * 64,
+                        "profile": payload["profile"],
+                        "preparedAt": "2026-08-24T00:00:00Z",
+                    }
+                )
+
+            def do_POST(self):
+                requests.append(("POST", self.path, dict(self.headers), None))
+                version = self.headers.get("X-Filler-Version")
+                self.send_payload(
+                    {
+                        "requestedState": "started",
+                        "actualState": "started",
+                        "sessionId": "safe-session",
+                        "filler": {
+                            "version": version,
+                            "status": "ready",
+                            "ready": True,
+                        },
+                    }
+                )
+
+        self.server = control.ThreadingHTTPServer(("127.0.0.1", 0), DownstreamHandler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        previous_url = os.environ.get("CROCCANTE_CONTROL_URL")
+        previous_token = os.environ.get("CROCCANTE_CONTROL_TOKEN_FILE")
+        self.previous_environment = (previous_url, previous_token)
+        os.environ["CROCCANTE_CONTROL_URL"] = f"http://127.0.0.1:{self.server.server_port}"
+        os.environ["CROCCANTE_CONTROL_TOKEN_FILE"] = str(self.token_file)
+        self.client = control.CroccanteClient()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
+        previous_url, previous_token = self.previous_environment
+        if previous_url is None:
+            os.environ.pop("CROCCANTE_CONTROL_URL", None)
+        else:
+            os.environ["CROCCANTE_CONTROL_URL"] = previous_url
+        if previous_token is None:
+            os.environ.pop("CROCCANTE_CONTROL_TOKEN_FILE", None)
+        else:
+            os.environ["CROCCANTE_CONTROL_TOKEN_FILE"] = previous_token
+        self.temp.cleanup()
+
+    def test_forwards_authenticated_preparation_and_exact_start_version(self):
+        payload = LifecycleTests.filler_payload(command="prepare-nine")
+        status, prepared = self.client.prepare("filler-v9", "prepare-nine", payload)
+        self.assertEqual(status, 200)
+        self.assertTrue(prepared["ready"])
+        acknowledgement = self.client.command("start", "start-nine", 9, "filler-v9")
+        self.assertTrue(acknowledgement["accepted"])
+        self.assertEqual(acknowledgement["fillerVersion"], "filler-v9")
+
+        preparation = self.requests[0]
+        self.assertEqual(preparation[0:2], ("PUT", "/v1/programs/test-program/fillers/filler-v9"))
+        self.assertEqual(preparation[2]["Authorization"], "Bearer outbound-secret")
+        self.assertEqual(preparation[2]["Idempotency-Key"], "prepare-nine")
+        self.assertEqual(preparation[3], payload)
+        start = self.requests[1]
+        self.assertEqual(start[0:2], ("POST", "/v1/programs/test-program/session/start"))
+        self.assertEqual(start[2]["X-Filler-Version"], "filler-v9")
+        self.assertEqual(start[2]["X-Command-Sequence"], "9")
+        self.assertNotIn("downloadUrl", json.dumps(prepared))
 
 
 if __name__ == "__main__":
