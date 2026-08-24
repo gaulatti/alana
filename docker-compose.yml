@@ -42,6 +42,8 @@ x-alana-base: &alana-base
   build:
     context: .
     dockerfile: Dockerfile
+    args:
+      ALANA_BUILD_VERSION: "${ALANA_BUILD_VERSION:-dev}"
   image: "${IMAGE_NAME:-alana:local}"
   restart: always
   shm_size: "${SHM_SIZE:-1g}"

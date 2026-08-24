@@ -4,6 +4,8 @@ FROM debian:bookworm-slim
 
 # Set environment variables
 ENV DEBIAN_FRONTEND=noninteractive
+ARG ALANA_BUILD_VERSION=dev
+ENV ALANA_BUILD_VERSION=${ALANA_BUILD_VERSION}
 ENV HOME=/config
 WORKDIR /config
 
@@ -76,8 +78,8 @@ RUN architecture="$(dpkg --print-architecture)" \
     && rm -f "/tmp/${archive}" /tmp/livekit-checksums.txt
 
 # Add runtime scripts
-COPY startup.sh validate-config.sh healthcheck.sh control-server.py /usr/local/bin/
-RUN chmod +x /usr/local/bin/startup.sh /usr/local/bin/validate-config.sh /usr/local/bin/healthcheck.sh /usr/local/bin/control-server.py
+COPY startup.sh validate-config.sh healthcheck.sh control-server.py alana_metrics.py metrics-event.py /usr/local/bin/
+RUN chmod +x /usr/local/bin/startup.sh /usr/local/bin/validate-config.sh /usr/local/bin/healthcheck.sh /usr/local/bin/control-server.py /usr/local/bin/metrics-event.py
 
 # Expose Chrome DevTools remote debugging port
 EXPOSE 8080 9222

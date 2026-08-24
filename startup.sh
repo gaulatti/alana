@@ -45,6 +45,7 @@ source /usr/local/bin/validate-config.sh
 set +e
 
 background_pids=()
+metric_event() { /usr/local/bin/metrics-event.py "$@" >/dev/null 2>&1 || true; }
 stop_pid_file() {
     [ -s "$1" ] || return 0
     pid=$(cat "$1" 2>/dev/null || true)
@@ -122,6 +123,7 @@ stall_watchdog() {
         if [ -n "${frame}" ] && [ "${frame}" != "${last}" ]; then last="${frame}"; advanced=$(date +%s); fi
         if [ $(( $(date +%s) - advanced )) -ge "${STALL_TIMEOUT}" ]; then
             echo "[${label}] stalled; restarting" >&2
+            metric_event stall "${label%%-*}"
             kill -9 "${pid}" 2>/dev/null || true
             return
         fi
@@ -150,8 +152,9 @@ rtmp_supervisor() (
     while true; do
         if ! video_args "${selected_encoder}"; then
             if [ "${ALLOW_SOFTWARE_FALLBACK}" = 1 ] && [ "${selected_encoder}" != libx264 ]; then
-                echo "[rtmp-${index}] explicit software fallback" >&2; selected_encoder=libx264; continue
+                echo "[rtmp-${index}] explicit software fallback" >&2; metric_event fallback rtmp; selected_encoder=libx264; continue
             fi
+            metric_event restart rtmp encoder_unavailable "${MAX_BACKOFF}"
             echo "[rtmp-${index}] encoder unavailable" >&2; sleep "${MAX_BACKOFF}"; continue
         fi
         unlink "${progress}" 2>/dev/null || true
@@ -165,9 +168,11 @@ rtmp_supervisor() (
         stall_watchdog "${rtmp_child}" "${progress}" "rtmp-${index}" & rtmp_watcher=$!
         wait "${rtmp_child}" 2>/dev/null; code=$?; kill "${rtmp_watcher}" 2>/dev/null || true; unlink "${pid_file}" 2>/dev/null || true
         duration=$(( $(date +%s) - started ))
+        metric_event restart rtmp exit "${backoff}"
         echo "[rtmp-${index}] exited code=${code} duration=${duration}s retry=${backoff}s" >&2
         if [ "${ALLOW_SOFTWARE_FALLBACK}" = 1 ] && [ "${selected_encoder}" != libx264 ] && [ "${duration}" -lt "${HEALTHY_RESET_SECONDS}" ]; then
             echo "[rtmp-${index}] explicit software fallback after encoder failure" >&2
+            metric_event fallback rtmp
             selected_encoder=libx264
         fi
         [ "${duration}" -ge "${HEALTHY_RESET_SECONDS}" ] && backoff="${RESTART_BACKOFF}"
@@ -203,6 +208,7 @@ livekit_supervisor() (
         started=$(date +%s); livekit_once & lk_child=$!; echo "${lk_child}" >"${LIVEKIT_PID_FILE}"
         stall_watchdog "${lk_child}" "${LIVEKIT_PROGRESS}" livekit & lk_watcher=$!
         wait "${lk_child}" 2>/dev/null; code=$?; kill "${lk_watcher}" 2>/dev/null || true; unlink "${LIVEKIT_PID_FILE}" 2>/dev/null || true
+        metric_event restart livekit exit "${backoff}"
         duration=$(( $(date +%s) - started )); echo "[livekit] exited code=${code} duration=${duration}s retry=${backoff}s" >&2
         [ "${duration}" -ge "${HEALTHY_RESET_SECONDS}" ] && backoff="${RESTART_BACKOFF}"
         sleep "${backoff}"; backoff=$((backoff * 2)); [ "${backoff}" -gt "${MAX_BACKOFF}" ] && backoff="${MAX_BACKOFF}"
@@ -216,9 +222,9 @@ for index in "${!outputs[@]}"; do rtmp_supervisor "$((index + 1))" "${outputs[in
 
 ( while true; do
     sleep 15
-    if ! [ -s "${BROWSER_PID_FILE}" ] || ! kill -0 "$(cat "${BROWSER_PID_FILE}")" 2>/dev/null; then launch_browser; fi
+    if ! [ -s "${BROWSER_PID_FILE}" ] || ! kill -0 "$(cat "${BROWSER_PID_FILE}")" 2>/dev/null; then metric_event restart browser watchdog 0; launch_browser; fi
 done ) & background_pids+=($!)
-( while true; do sleep 15; pactl info >/dev/null 2>&1 || { pulseaudio --start --exit-idle-time=-1 2>/dev/null || true; sleep 2; pactl load-module module-null-sink sink_name=stream_out >/dev/null 2>&1 || true; pactl set-default-sink stream_out 2>/dev/null || true; }; done ) & background_pids+=($!)
+( while true; do sleep 15; pactl info >/dev/null 2>&1 || { metric_event restart audio watchdog 0; pulseaudio --start --exit-idle-time=-1 2>/dev/null || true; sleep 2; pactl load-module module-null-sink sink_name=stream_out >/dev/null 2>&1 || true; pactl set-default-sink stream_out 2>/dev/null || true; }; done ) & background_pids+=($!)
 
 echo "[startup] program=${PROGRAM_ID} rtmp_outputs=${#outputs[@]} livekit_enabled=${LIVEKIT_ENABLED}" >&2
 while true; do

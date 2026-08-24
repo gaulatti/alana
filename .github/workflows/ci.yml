@@ -37,3 +37,44 @@ jobs:
           push: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  observability-runtime:
+    runs-on: ubuntu-latest
+    env:
+      PROGRAM_ID: test-program
+      CHANNEL_BROWSER_URL: http://renderer.test/program
+      RTMP_OUTPUTS: rtmp://relay.test/live/redacted
+      CROCCANTE_CONTROL_URL: http://croccante.test:8081
+      ALANA_CONTROL_TOKEN_FILE: ./secrets/alana-control-token
+      CROCCANTE_CONTROL_TOKEN_FILE: ./secrets/croccante-control-token
+      ALANA_BUILD_VERSION: ci-test
+      PLATFORM: linux/amd64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start stopped private runtime
+        run: |
+          mkdir -p secrets
+          printf 'fixture-alana-token\n' > secrets/alana-control-token
+          printf 'fixture-croccante-token\n' > secrets/croccante-control-token
+          docker network create broadcast-control
+          docker compose up --build -d alana
+      - name: Scrape and parse private metrics
+        run: |
+          for attempt in $(seq 1 60); do
+            if docker compose exec -T alana python3 -c 'from pathlib import Path; from urllib.request import Request, urlopen; token=Path("/run/secrets/alana-control-token").read_text().strip(); urlopen(Request("http://127.0.0.1:8080/metrics", headers={"Authorization": f"Bearer {token}"}), timeout=2)' 2>/dev/null; then
+              break
+            fi
+            sleep 2
+          done
+          docker compose exec -T alana python3 -c 'from urllib.error import HTTPError; from urllib.request import urlopen; exec("try:\n urlopen(\"http://127.0.0.1:8080/metrics\")\nexcept HTTPError as error:\n assert error.code == 401\nelse:\n raise AssertionError(\"anonymous scrape was accepted\")")'
+          docker compose exec -T alana python3 -c 'from pathlib import Path; from urllib.request import Request, urlopen; token=Path("/run/secrets/alana-control-token").read_text().strip(); response=urlopen(Request("http://127.0.0.1:8080/metrics", headers={"Authorization": f"Bearer {token}"})); assert response.headers["Content-Type"] == "text/plain; version=0.0.4; charset=utf-8"; print(response.read().decode(), end="")' > /tmp/alana.prom
+          ! rg -n 'test-program|relay\.test|fixture-.*-token' /tmp/alana.prom
+          docker run --rm -i --entrypoint /bin/promtool prom/prometheus:v3.9.0 check metrics < /tmp/alana.prom
+      - name: Show logs on failure
+        if: failure()
+        run: docker compose logs --no-color
+      - name: Tear down private runtime
+        if: always()
+        run: |
+          docker compose down --volumes
+          docker network rm broadcast-control
