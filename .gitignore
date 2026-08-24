@@ -8,6 +8,8 @@ package-lock.json
 
 # Environment (contains secrets)
 .env
+__pycache__/
+*.pyc
 
 # Benchmark tools (dev-only)
 bench/

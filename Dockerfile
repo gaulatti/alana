@@ -21,6 +21,7 @@ RUN architecture="$(dpkg --print-architecture)" \
     dbus-x11 \
     pulseaudio \
     pulseaudio-utils \
+    python3 \
     ffmpeg \
     vainfo \
     libva2 \
@@ -75,13 +76,13 @@ RUN architecture="$(dpkg --print-architecture)" \
     && rm -f "/tmp/${archive}" /tmp/livekit-checksums.txt
 
 # Add runtime scripts
-COPY startup.sh validate-config.sh healthcheck.sh /usr/local/bin/
-RUN chmod +x /usr/local/bin/startup.sh /usr/local/bin/validate-config.sh /usr/local/bin/healthcheck.sh
+COPY startup.sh validate-config.sh healthcheck.sh control-server.py /usr/local/bin/
+RUN chmod +x /usr/local/bin/startup.sh /usr/local/bin/validate-config.sh /usr/local/bin/healthcheck.sh /usr/local/bin/control-server.py
 
 # Expose Chrome DevTools remote debugging port
-EXPOSE 9222
+EXPOSE 8080 9222
 
 HEALTHCHECK --interval=15s --timeout=5s --start-period=45s --retries=3 CMD ["/usr/local/bin/healthcheck.sh"]
 
-# Set the entrypoint to the startup script
-ENTRYPOINT ["/usr/local/bin/startup.sh"]
+# The control server owns the publisher subprocess and its lifecycle.
+ENTRYPOINT ["/usr/local/bin/control-server.py"]
