@@ -180,6 +180,54 @@ Backoff doubles to the configured cap and resets after sustained health.
 Stalled encoders are killed and restarted. Browser failure restarts only
 Chromium. LiveKit failure leaves every RTMP encoder untouched.
 
+## Prometheus observability
+
+Alana exposes Prometheus text format 0.0.4 at `GET /metrics` on the same private
+port 8080 listener as lifecycle control. The route uses the existing
+`ALANA_CONTROL_TOKEN_FILE` bearer credential and returns `401` when the token is
+missing or incorrect. The supplied Compose stack does not publish port 8080;
+the managed scraper must reach it over a private Docker or service network.
+
+The collector does not expose program IDs, renderer or publish URLs, output
+indices, room names, stream keys, tokens, raw errors, or other unbounded values.
+RTMP legs are aggregated into configured, healthy, and progressing counts.
+
+| Metric | Meaning | Bounded labels |
+| --- | --- | --- |
+| `alana_service_info` | Service, Python runtime, and build identity | `service`, `runtime`, `version` |
+| `alana_process_start_time_seconds` | Control-process start time | none |
+| `alana_process_resident_memory_bytes` | Control-process resident memory | none |
+| `alana_http_requests_total` | Private HTTP requests by normalized outcome | `method`, `route`, `status_class` |
+| `alana_http_request_duration_seconds` | Private HTTP request latency | `method`, `route` |
+| `alana_dependency_operations_total` | Croccante Start/Stop results | `dependency`, `operation`, `result` |
+| `alana_dependency_duration_seconds` | Croccante control latency | `dependency`, `operation` |
+| `alana_lifecycle_commands_total` | Start/Stop command outcomes | `action`, `result` |
+| `alana_reconcile_cycles_total` | Reconciliation success/failure | `result` |
+| `alana_lifecycle_state` | One-hot actual lifecycle state | `state` |
+| `alana_pipeline_process_healthy` | Pipeline supervisor liveness | none |
+| `alana_browser_healthy` | Chromium capture liveness | none |
+| `alana_rtmp_outputs_configured` | Configured RTMP leg count | none |
+| `alana_rtmp_outputs_healthy` | RTMP legs with a live encoder | none |
+| `alana_rtmp_outputs_progressing` | RTMP legs reporting frame progress | none |
+| `alana_livekit_enabled` | LiveKit configuration state | none |
+| `alana_livekit_healthy` | LiveKit runtime health | none |
+| `alana_stream_restarts_total` | Supervisor retries by leg/reason | `leg`, `reason` |
+| `alana_stream_stalls_total` | Watchdog stalls by leg | `leg` |
+| `alana_restart_backoff_seconds` | Observed restart backoff histogram | `leg` |
+| `alana_software_fallbacks_total` | Explicit software fallbacks | `leg` |
+
+For a private in-container check:
+
+```bash
+docker compose exec -T alana python3 -c 'from pathlib import Path; from urllib.request import Request, urlopen; token=Path("/run/secrets/alana-control-token").read_text().strip(); print(urlopen(Request("http://127.0.0.1:8080/metrics", headers={"Authorization": f"Bearer {token}"})).read().decode())'
+```
+
+`ALANA_BUILD_VERSION` may be supplied as a short release or source identifier;
+Compose defaults it to `dev`. Application instrumentation and its private
+endpoint belong here. The `gaulatti/prometheus` deployment separately owns the
+private target, credential delivery, storage, dashboards, and alerts and must
+be updated before production scraping begins.
+
 `PIPELINE_READY_TIMEOUT` controls how long Start waits for browser and publisher
 readiness (default 90 seconds). `CONTROL_RETRY_SECONDS` controls reconciliation
 and failed-ack retry cadence (default 5 seconds).

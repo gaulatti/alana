@@ -59,6 +59,7 @@ class LifecycleTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.events = []
         self.store = control.StateStore(Path(self.temp.name))
+        control.METRICS = control.Metrics(Path(self.temp.name) / "runtime-metrics.json")
         self.pipeline = FakePipeline(self.events)
         self.croccante = FakeCroccante(self.events)
         self.manager = control.LifecycleManager(
@@ -198,6 +199,27 @@ class LifecycleTests(unittest.TestCase):
             )
             with urlopen(request) as response:
                 self.assertEqual(response.status, 200)
+
+            with self.assertRaises(HTTPError) as unauthorized_metrics:
+                urlopen(f"{origin}{control.METRICS_PATH}")
+            self.assertEqual(unauthorized_metrics.exception.code, 401)
+            unauthorized_metrics.exception.close()
+
+            metrics_request = Request(
+                f"{origin}{control.METRICS_PATH}",
+                headers={"Authorization": "Bearer api-secret"},
+            )
+            with urlopen(metrics_request) as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(
+                    response.headers["Content-Type"],
+                    "text/plain; version=0.0.4; charset=utf-8",
+                )
+                metrics = response.read().decode()
+            self.assertIn("alana_service_info", metrics)
+            self.assertIn("alana_lifecycle_state", metrics)
+            self.assertNotIn("test-program", metrics)
+            self.assertNotIn("api-secret", metrics)
 
             wrong = Request(
                 f"{origin}/v1/programs/not-this-program/lifecycle",

@@ -5,7 +5,7 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "${repo_root}"
 
 bash -n startup.sh validate-config.sh healthcheck.sh
-python3 -m py_compile control-server.py
+python3 -m py_compile control-server.py alana_metrics.py metrics-event.py
 python3 -m unittest discover -s test -p 'test_*.py'
 
 token_dir=$(mktemp -d)
@@ -58,7 +58,10 @@ rg -Fqx 'set +e' startup.sh
 rg -q '/tmp/rtmp-\*\.pid' healthcheck.sh
 rg -q 'actual_state.*running' healthcheck.sh
 rg -Fq 'ENTRYPOINT ["/usr/local/bin/control-server.py"]' Dockerfile
+rg -Fq 'COPY startup.sh validate-config.sh healthcheck.sh control-server.py alana_metrics.py metrics-event.py /usr/local/bin/' Dockerfile
 rg -q 'alana_state:/var/lib/alana' docker-compose.yml
+rg -q 'METRICS_PATH = "/metrics"' control-server.py
+rg -q 'metric_event restart rtmp' startup.sh
 rg -q 'ffmpeg .* -loglevel quiet' startup.sh
 if rg -n 'rtmp-.*\.log|livekit-publisher\.log|channel-browser\.log' startup.sh; then
     echo "credential-bearing child-process diagnostics must not be retained" >&2

@@ -20,6 +20,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urlsplit
 from urllib.request import Request, urlopen
 
+from alana_metrics import Metrics
+
 
 PROGRAM_ID = os.environ.get("PROGRAM_ID", "")
 STATE_DIR = Path(os.environ.get("ALANA_STATE_DIR", "/var/lib/alana"))
@@ -31,6 +33,8 @@ CONTROL_PORT = int(os.environ.get("ALANA_CONTROL_PORT", "8080"))
 PIPELINE_READY_TIMEOUT = int(os.environ.get("PIPELINE_READY_TIMEOUT", "90"))
 CONTROL_RETRY_SECONDS = int(os.environ.get("CONTROL_RETRY_SECONDS", "5"))
 PROGRAM_PATH = f"/v1/programs/{quote(PROGRAM_ID, safe='')}/lifecycle"
+METRICS_PATH = "/metrics"
+METRICS = Metrics()
 
 
 def now() -> str:
@@ -218,9 +222,15 @@ class CroccanteClient:
         )
 
     def command(self, action: str, key: str, sequence: int) -> dict[str, object]:
+        started = time.monotonic()
+
+        def finish(payload: dict[str, object], result: str) -> dict[str, object]:
+            METRICS.observe_dependency(action, result, time.monotonic() - started)
+            return payload
+
         token = read_text(self.token_file)
         if not token:
-            return {"accepted": False, "error": "control-token-unavailable"}
+            return finish({"accepted": False, "error": "control-token-unavailable"}, "token_unavailable")
         url = (
             f"{self.base_url}/v1/programs/{quote(PROGRAM_ID, safe='')}/session/{action}"
         )
@@ -238,19 +248,21 @@ class CroccanteClient:
             with urlopen(request, timeout=5) as response:
                 payload = json.loads(response.read())
         except HTTPError as exc:
-            return {"accepted": False, "error": f"http-{exc.code}"}
-        except (URLError, TimeoutError, OSError, json.JSONDecodeError):
-            return {"accepted": False, "error": "unavailable-or-invalid-response"}
+            return finish({"accepted": False, "error": f"http-{exc.code}"}, "http_error")
+        except json.JSONDecodeError:
+            return finish({"accepted": False, "error": "unavailable-or-invalid-response"}, "invalid_response")
+        except (URLError, TimeoutError, OSError):
+            return finish({"accepted": False, "error": "unavailable-or-invalid-response"}, "unavailable")
 
         expected = "started" if action == "start" else "stopped"
         accepted = payload.get("requestedState") == expected
-        return {
+        return finish({
             "accepted": accepted,
             "requestedState": payload.get("requestedState"),
             "actualState": payload.get("actualState"),
             "sessionId": payload.get("sessionId"),
             **({} if accepted else {"error": "unexpected-state"}),
-        }
+        }, "success" if accepted else "unexpected_state")
 
 
 class LifecycleManager:
@@ -510,7 +522,9 @@ class LifecycleManager:
         while not self.closed.wait(CONTROL_RETRY_SECONDS):
             try:
                 self.reconcile_once()
+                METRICS.observe_reconcile("success")
             except Exception as exc:
+                METRICS.observe_reconcile("failure")
                 # Exception types are safe to log; messages may contain URLs.
                 print(f"[lifecycle] reconcile failed type={type(exc).__name__}", flush=True)
 
@@ -531,23 +545,39 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, format_string: str, *args: object) -> None:
         status = args[1] if len(args) > 1 else "-"
         path = urlsplit(self.path).path
-        route = "lifecycle" if path.startswith("/v1/programs/") else "unknown"
+        route = "metrics" if path == METRICS_PATH else "lifecycle" if path.startswith("/v1/programs/") else "unknown"
         print(f"[control] {self.command} route={route} status={status}", flush=True)
 
     def send_json(self, status: int, payload: dict[str, object]) -> None:
         body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
         self.send_response(status)
+        self.response_status = status
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
-    def authorize_and_scope(self) -> bool:
+    def send_metrics(self, payload: str) -> None:
+        body = payload.encode()
+        self.send_response(200)
+        self.response_status = 200
+        self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def authorize(self) -> bool:
         expected = read_text(CONTROL_TOKEN_FILE)
         supplied = self.headers.get("Authorization", "")
         if not expected or not hmac.compare_digest(supplied, f"Bearer {expected}"):
             self.send_json(401, {"error": "unauthorized"})
+            return False
+        return True
+
+    def authorize_and_scope(self) -> bool:
+        if not self.authorize():
             return False
         path = urlsplit(self.path).path
         prefix = "/v1/programs/"
@@ -560,34 +590,54 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def do_GET(self) -> None:  # noqa: N802
-        if not self.authorize_and_scope():
-            return
-        if urlsplit(self.path).path != PROGRAM_PATH:
-            self.send_json(404, {"error": "not found"})
-            return
-        self.send_json(200, manager().view())
+        started = time.monotonic()
+        self.response_status = 500
+        path = urlsplit(self.path).path
+        route = "metrics" if path == METRICS_PATH else "lifecycle" if path.startswith("/v1/programs/") else "unknown"
+        try:
+            if path == METRICS_PATH:
+                if self.authorize():
+                    self.send_metrics(METRICS.render(manager().view()))
+                return
+            if not self.authorize_and_scope():
+                return
+            if path != PROGRAM_PATH:
+                self.send_json(404, {"error": "not found"})
+                return
+            self.send_json(200, manager().view())
+        finally:
+            METRICS.observe_http("GET", route, self.response_status, time.monotonic() - started)
 
     def do_POST(self) -> None:  # noqa: N802
-        if not self.authorize_and_scope():
-            return
+        started = time.monotonic()
+        self.response_status = 500
         path = urlsplit(self.path).path
-        if path not in (f"{PROGRAM_PATH}/start", f"{PROGRAM_PATH}/stop"):
-            self.send_json(404, {"error": "not found"})
-            return
-        key = self.headers.get("Idempotency-Key", "").strip()
-        sequence_text = self.headers.get("X-Command-Sequence", "").strip()
-        if not key or len(key) > 200:
-            self.send_json(400, {"error": "a bounded Idempotency-Key is required"})
-            return
+        route = "lifecycle" if path.startswith("/v1/programs/") else "unknown"
         try:
-            sequence = int(sequence_text)
-            if sequence < 1:
-                raise ValueError
-        except ValueError:
-            self.send_json(400, {"error": "X-Command-Sequence must be a positive integer"})
-            return
-        status, payload = manager().command(path.rsplit("/", 1)[1], key, sequence)
-        self.send_json(status, payload)
+            if not self.authorize_and_scope():
+                return
+            if path not in (f"{PROGRAM_PATH}/start", f"{PROGRAM_PATH}/stop"):
+                self.send_json(404, {"error": "not found"})
+                return
+            key = self.headers.get("Idempotency-Key", "").strip()
+            sequence_text = self.headers.get("X-Command-Sequence", "").strip()
+            if not key or len(key) > 200:
+                self.send_json(400, {"error": "a bounded Idempotency-Key is required"})
+                return
+            try:
+                sequence = int(sequence_text)
+                if sequence < 1:
+                    raise ValueError
+            except ValueError:
+                self.send_json(400, {"error": "X-Command-Sequence must be a positive integer"})
+                return
+            action = path.rsplit("/", 1)[1]
+            status, payload = manager().command(action, key, sequence)
+            command_result = "success" if status < 300 else "conflict" if status == 409 else "dependency_failure" if status == 502 else "not_ready" if status == 503 else "failure"
+            METRICS.observe_command(action, command_result)
+            self.send_json(status, payload)
+        finally:
+            METRICS.observe_http("POST", route, self.response_status, time.monotonic() - started)
 
 
 def main() -> None:
