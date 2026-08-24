@@ -12,6 +12,9 @@ Alana is lifecycle-controlled: it does not render or publish until an
 authenticated Start command is accepted. It acknowledges Start only after the
 local pipeline is ready and Croccante has acknowledged its matching session;
 Stop is acknowledged by Croccante before Alana tears down local output.
+Alcantara separately prepares the next television filler through Alana before
+Start. Alana relays the exact immutable version to Croccante and never
+transcodes or stores filler media itself.
 
 ## Architecture
 
@@ -77,11 +80,56 @@ a stable `Idempotency-Key` and a positive, monotonically increasing
 | `GET` | `/v1/programs/{programId}/lifecycle` | Requested/actual state, readiness, active program, timestamps, last command, output health, and Croccante acknowledgement |
 | `POST` | `/v1/programs/{programId}/lifecycle/start` | Ready local output, then request Croccante Start |
 | `POST` | `/v1/programs/{programId}/lifecycle/stop` | Request Croccante Stop, then tear down local output |
+| `PUT` | `/v1/programs/{programId}/fillers/{version}` | Idempotently prepare the next-session television filler in Croccante |
+| `GET` | `/v1/programs/{programId}/fillers/{version}` | Reconcile and report Croccante's readiness for one version |
 
 Commands for another program return 404. Replayed keys return their original
 result without repeating side effects; old sequences and concurrent transitions
 return 409. Token values, publish URLs, and raw idempotency keys are never stored
 in lifecycle state or emitted by the control server.
+
+Filler preparation is a separate authenticated machine operation. The `PUT`
+uses an `Idempotency-Key` equal to the bounded `commandId` in the JSON body and
+accepts Croccante's source and live-profile contract:
+
+```json
+{
+  "commandId": "alcantara-filler-123",
+  "source": {
+    "id": "asset-456",
+    "sha256": "64-lowercase-hex-characters",
+    "downloadUrl": "https://signed-download.example/object"
+  },
+  "profile": {
+    "width": 1920,
+    "height": 1080,
+    "fps": 30,
+    "videoBitrate": "6000k",
+    "audioRate": 48000,
+    "audioChannels": 2,
+    "audioBitrate": "160k",
+    "gop": 60,
+    "loopSeconds": 10
+  }
+}
+```
+
+Alana forwards the signed download material only in that request. Durable and
+public state contains bounded readiness/failure information, source identity
+and checksum, artifact checksum, and profile, but never the download URL or a
+credential. Repeating an identical version is safe; changing the semantic
+content of an existing version returns `409`. A failed or interrupted request
+remains visible and retryable, and restart reconciliation checks Croccante's
+durable prepared state without needing the signed URL again.
+
+Start fails closed until a pending version is ready. Alana passes that exact
+version to Croccante with `X-Filler-Version` and reports Running only when
+Croccante acknowledges the same ready version. The active version cannot change
+during a session. Preparing another version while Running creates a pending
+next-session version; Stop preserves the newest pending version, or makes the
+just-stopped version available for the next Start when no replacement exists.
+Alana does not invent a filler, transcode media, or retain platform destination
+keys.
 
 The persisted state machine is `stopped -> starting -> running -> stopping ->
 stopped`, with `degraded` or `failed` representing recoverable faults. A failed
@@ -199,11 +247,15 @@ RTMP legs are aggregated into configured, healthy, and progressing counts.
 | `alana_process_resident_memory_bytes` | Control-process resident memory | none |
 | `alana_http_requests_total` | Private HTTP requests by normalized outcome | `method`, `route`, `status_class` |
 | `alana_http_request_duration_seconds` | Private HTTP request latency | `method`, `route` |
-| `alana_dependency_operations_total` | Croccante Start/Stop results | `dependency`, `operation`, `result` |
-| `alana_dependency_duration_seconds` | Croccante control latency | `dependency`, `operation` |
+| `alana_dependency_operations_total` | Croccante lifecycle and filler-operation results | `dependency`, `operation`, `result` |
+| `alana_dependency_duration_seconds` | Croccante lifecycle and filler-operation latency | `dependency`, `operation` |
 | `alana_lifecycle_commands_total` | Start/Stop command outcomes | `action`, `result` |
 | `alana_reconcile_cycles_total` | Reconciliation success/failure | `result` |
+| `alana_filler_preparations_total` | Preparation, duplicate, conflict, retry, and reconciliation outcomes | `result` |
 | `alana_lifecycle_state` | One-hot actual lifecycle state | `state` |
+| `alana_filler_active` | Whether the current session is bound to a prepared version | none |
+| `alana_filler_pending` | Whether a next-session version is configured | none |
+| `alana_filler_pending_ready` | Whether Croccante acknowledged that pending version | none |
 | `alana_pipeline_process_healthy` | Pipeline supervisor liveness | none |
 | `alana_browser_healthy` | Chromium capture liveness | none |
 | `alana_rtmp_outputs_configured` | Configured RTMP leg count | none |

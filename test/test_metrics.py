@@ -37,11 +37,15 @@ class MetricsTests(unittest.TestCase):
     def test_success_failure_and_runtime_outcomes_render_with_bounded_labels(self):
         self.metrics.observe_http("GET", "lifecycle", 200, 0.02)
         self.metrics.observe_http("POST", "lifecycle", 503, 1.2)
+        self.metrics.observe_http("PUT", "filler", 200, 2.4)
         self.metrics.observe_dependency("start", "success", 0.1)
         self.metrics.observe_dependency("stop", "unavailable", 5.0)
+        self.metrics.observe_dependency("prepare", "success", 2.0)
         self.metrics.observe_command("start", "success")
         self.metrics.observe_command("stop", "dependency_failure")
         self.metrics.observe_reconcile("failure")
+        self.metrics.observe_preparation("success")
+        self.metrics.observe_preparation("not_ready")
         record_runtime_event(self.runtime_path, "stall", "rtmp")
         record_runtime_event(self.runtime_path, "restart", "rtmp", "stall", 5)
         record_runtime_event(self.runtime_path, "fallback", "rtmp")
@@ -50,7 +54,10 @@ class MetricsTests(unittest.TestCase):
 
         self.assertIn('alana_http_requests_total{method="GET",route="lifecycle",status_class="2xx"} 1', rendered)
         self.assertIn('alana_http_requests_total{method="POST",route="lifecycle",status_class="5xx"} 1', rendered)
+        self.assertIn('alana_http_requests_total{method="PUT",route="filler",status_class="2xx"} 1', rendered)
         self.assertIn('alana_dependency_operations_total{dependency="croccante",operation="stop",result="unavailable"} 1', rendered)
+        self.assertIn('alana_filler_preparations_total{result="success"} 1', rendered)
+        self.assertIn("alana_filler_pending 0", rendered)
         self.assertIn('alana_stream_restarts_total{leg="rtmp",reason="stall"} 1', rendered)
         self.assertIn('alana_rtmp_outputs_configured 2', rendered)
         self.assertIn('alana_rtmp_outputs_healthy 1', rendered)
@@ -60,6 +67,8 @@ class MetricsTests(unittest.TestCase):
             self.metrics.observe_dependency("publish", "success", 0.1)
         with self.assertRaises(ValueError):
             self.metrics.observe_command("start", "program-123")
+        with self.assertRaises(ValueError):
+            self.metrics.observe_preparation("program-123")
         with self.assertRaises(ValueError):
             record_runtime_event(self.runtime_path, "restart", "rtmp", "https://private.example", 5)
         with self.assertRaises(ValueError):
