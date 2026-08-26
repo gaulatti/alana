@@ -68,7 +68,7 @@ jobs:
           done
           docker compose exec -T alana python3 -c 'from urllib.error import HTTPError; from urllib.request import urlopen; exec("try:\n urlopen(\"http://127.0.0.1:8080/metrics\")\nexcept HTTPError as error:\n assert error.code == 401\nelse:\n raise AssertionError(\"anonymous scrape was accepted\")")'
           docker compose exec -T alana python3 -c 'from pathlib import Path; from urllib.request import Request, urlopen; token=Path("/run/secrets/alana-control-token").read_text().strip(); response=urlopen(Request("http://127.0.0.1:8080/metrics", headers={"Authorization": f"Bearer {token}"})); assert response.headers["Content-Type"] == "text/plain; version=0.0.4; charset=utf-8"; print(response.read().decode(), end="")' > /tmp/alana.prom
-          ! rg -n 'test-program|relay\.test|fixture-.*-token' /tmp/alana.prom
+          ! grep -En 'test-program|relay\.test|fixture-.*-token' /tmp/alana.prom
           docker run --rm -i --entrypoint /bin/promtool prom/prometheus:v3.9.0 check metrics < /tmp/alana.prom
       - name: Show logs on failure
         if: failure()

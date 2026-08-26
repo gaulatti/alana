@@ -302,8 +302,8 @@ RTMP legs are aggregated into configured, healthy, and progressing counts.
 | `alana_filler_active` | Whether the current session is bound to a prepared version | none |
 | `alana_filler_pending` | Whether a next-session version is configured | none |
 | `alana_filler_pending_ready` | Whether Croccante acknowledged that pending version | none |
-| `alana_destination_active_count` | Opaque destinations bound to the active broadcast | none |
-| `alana_destination_pending_count` | Opaque destinations in the validated next selection | none |
+| `alana_destinations_active` | Opaque destinations bound to the active broadcast | none |
+| `alana_destinations_pending` | Opaque destinations in the validated next selection | none |
 | `alana_pipeline_process_healthy` | Pipeline supervisor liveness | none |
 | `alana_browser_healthy` | Chromium capture liveness | none |
 | `alana_rtmp_outputs_configured` | Configured RTMP leg count | none |

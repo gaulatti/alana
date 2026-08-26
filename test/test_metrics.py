@@ -64,8 +64,8 @@ class MetricsTests(unittest.TestCase):
             'alana_destination_operations_total{action="reload",result="success"} 1',
             rendered,
         )
-        self.assertIn("alana_destination_active_count 2", rendered)
-        self.assertIn("alana_destination_pending_count 1", rendered)
+        self.assertIn("alana_destinations_active 2", rendered)
+        self.assertIn("alana_destinations_pending 1", rendered)
         self.assertIn("alana_filler_pending 0", rendered)
         self.assertIn('alana_stream_restarts_total{leg="rtmp",reason="stall"} 1', rendered)
         self.assertIn('alana_rtmp_outputs_configured 2', rendered)

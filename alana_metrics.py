@@ -267,7 +267,7 @@ class Metrics:
         pending_destinations = snapshot.get("pendingDestinations")
         self._gauge(
             lines,
-            "alana_destination_active_count",
+            "alana_destinations_active",
             "Opaque destinations bound to the active broadcast.",
             int(active_destinations.get("count", 0))
             if isinstance(active_destinations, dict)
@@ -275,7 +275,7 @@ class Metrics:
         )
         self._gauge(
             lines,
-            "alana_destination_pending_count",
+            "alana_destinations_pending",
             "Opaque destinations in the validated next selection.",
             int(pending_destinations.get("count", 0))
             if isinstance(pending_destinations, dict)
