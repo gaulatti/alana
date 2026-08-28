@@ -15,6 +15,9 @@ Stop is acknowledged by Croccante before Alana tears down local output.
 Alcantara separately prepares the next television filler through Alana before
 Start. Alana relays the exact immutable version to Croccante and never
 transcodes or stores filler media itself.
+For public broadcast destinations, Alana is a transport-only boundary: it
+validates and forwards Alcantara's exact opaque IDs and versioned Secrets
+Manager references, but never resolves a reference or handles a stream key.
 
 ## Architecture
 
@@ -71,15 +74,16 @@ openssl rand -hex 32 > secrets/alana-control-token
 # Put Croccante's separately generated token in secrets/croccante-control-token.
 ```
 
-Every request uses `Authorization: Bearer <token>`. Mutating requests also need
-a stable `Idempotency-Key` and a positive, monotonically increasing
-`X-Command-Sequence`:
+Every request uses `Authorization: Bearer <token>`. Mutating requests need a
+stable `Idempotency-Key`; lifecycle Start/Stop also need a positive,
+monotonically increasing `X-Command-Sequence`:
 
 | Method | Private path | Meaning |
 | --- | --- | --- |
 | `GET` | `/v1/programs/{programId}/lifecycle` | Requested/actual state, readiness, active program, timestamps, last command, output health, and Croccante acknowledgement |
 | `POST` | `/v1/programs/{programId}/lifecycle/start` | Ready local output, then request Croccante Start |
 | `POST` | `/v1/programs/{programId}/lifecycle/stop` | Request Croccante Stop, then tear down local output |
+| `PUT` | `/v1/programs/{programId}/destinations/{version}` | While stopped, validate/reload an exact destination selection through Croccante |
 | `PUT` | `/v1/programs/{programId}/fillers/{version}` | Idempotently prepare the next-session television filler in Croccante |
 | `GET` | `/v1/programs/{programId}/fillers/{version}` | Reconcile and report Croccante's readiness for one version |
 
@@ -130,6 +134,47 @@ next-session version; Stop preserves the newest pending version, or makes the
 just-stopped version available for the next Start when no replacement exists.
 Alana does not invent a filler, transcode media, or retain platform destination
 keys.
+
+### Versioned destination transport
+
+Start's JSON body is the exact destination selection authorized by Alcantara:
+
+```json
+{
+  "version": "destinations-2026-08-26.1",
+  "destinations": [
+    {
+      "id": "primary",
+      "secretId": "broadcast/example/primary",
+      "versionId": "00000000-0000-0000-0000-000000000000"
+    }
+  ]
+}
+```
+
+The list contains 1-20 unique opaque IDs. Unknown fields, malformed or
+duplicate IDs, invalid references, an oversized body, or a changed selection
+on idempotent replay fail before Alana starts its local output. After local
+readiness, Alana forwards the normalized selection byte-for-byte semantically;
+Croccante resolves every exact secret version and must acknowledge the same
+selection version, SHA-256 selection hash, count, and opaque IDs before Alana
+reports Running. Partial or mismatched downstream state is Degraded, never a
+false success.
+
+While stopped, `PUT /destinations/{version}` accepts the same selection plus a
+`commandId` equal to the `Idempotency-Key`. It propagates Croccante's explicit
+validation/reload operation. Reconfiguration while Starting, Running,
+Degraded, or while the local pipeline remains alive returns `409`; active
+broadcast destinations are immutable until an explicit Stop.
+
+Secret references exist only in the bounded inbound and downstream request
+objects. Durable lifecycle and idempotency state stores only the version,
+selection hash, count, and opaque IDs. API responses, metrics, logs, state
+files, and process arguments omit secret references, URLs, provider bodies,
+and keys. After restart, Alana reconciles the persisted redacted fingerprint
+against Croccante's authoritative session state. If Croccante has not accepted
+the selection, Alcantara must safely replay the original Start command so Alana
+can forward the exact references again.
 
 The persisted state machine is `stopped -> starting -> running -> stopping ->
 stopped`, with `degraded` or `failed` representing recoverable faults. A failed
@@ -247,15 +292,18 @@ RTMP legs are aggregated into configured, healthy, and progressing counts.
 | `alana_process_resident_memory_bytes` | Control-process resident memory | none |
 | `alana_http_requests_total` | Private HTTP requests by normalized outcome | `method`, `route`, `status_class` |
 | `alana_http_request_duration_seconds` | Private HTTP request latency | `method`, `route` |
-| `alana_dependency_operations_total` | Croccante lifecycle and filler-operation results | `dependency`, `operation`, `result` |
-| `alana_dependency_duration_seconds` | Croccante lifecycle and filler-operation latency | `dependency`, `operation` |
+| `alana_dependency_operations_total` | Croccante lifecycle, filler, destination, and status results | `dependency`, `operation`, `result` |
+| `alana_dependency_duration_seconds` | Croccante operation latency | `dependency`, `operation` |
 | `alana_lifecycle_commands_total` | Start/Stop command outcomes | `action`, `result` |
 | `alana_reconcile_cycles_total` | Reconciliation success/failure | `result` |
 | `alana_filler_preparations_total` | Preparation, duplicate, conflict, retry, and reconciliation outcomes | `result` |
+| `alana_destination_operations_total` | Destination reload validation outcomes | `action`, `result` |
 | `alana_lifecycle_state` | One-hot actual lifecycle state | `state` |
 | `alana_filler_active` | Whether the current session is bound to a prepared version | none |
 | `alana_filler_pending` | Whether a next-session version is configured | none |
 | `alana_filler_pending_ready` | Whether Croccante acknowledged that pending version | none |
+| `alana_destinations_active` | Opaque destinations bound to the active broadcast | none |
+| `alana_destinations_pending` | Opaque destinations in the validated next selection | none |
 | `alana_pipeline_process_healthy` | Pipeline supervisor liveness | none |
 | `alana_browser_healthy` | Chromium capture liveness | none |
 | `alana_rtmp_outputs_configured` | Configured RTMP leg count | none |

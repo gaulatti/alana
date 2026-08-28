@@ -32,6 +32,8 @@ class MetricsTests(unittest.TestCase):
             ],
             "livekitEnabled": True,
             "livekitHealthy": False,
+            "activeDestinations": {"count": 2},
+            "pendingDestinations": {"count": 1},
         }
 
     def test_success_failure_and_runtime_outcomes_render_with_bounded_labels(self):
@@ -46,6 +48,7 @@ class MetricsTests(unittest.TestCase):
         self.metrics.observe_reconcile("failure")
         self.metrics.observe_preparation("success")
         self.metrics.observe_preparation("not_ready")
+        self.metrics.observe_destination("reload", "success")
         record_runtime_event(self.runtime_path, "stall", "rtmp")
         record_runtime_event(self.runtime_path, "restart", "rtmp", "stall", 5)
         record_runtime_event(self.runtime_path, "fallback", "rtmp")
@@ -57,6 +60,12 @@ class MetricsTests(unittest.TestCase):
         self.assertIn('alana_http_requests_total{method="PUT",route="filler",status_class="2xx"} 1', rendered)
         self.assertIn('alana_dependency_operations_total{dependency="croccante",operation="stop",result="unavailable"} 1', rendered)
         self.assertIn('alana_filler_preparations_total{result="success"} 1', rendered)
+        self.assertIn(
+            'alana_destination_operations_total{action="reload",result="success"} 1',
+            rendered,
+        )
+        self.assertIn("alana_destinations_active 2", rendered)
+        self.assertIn("alana_destinations_pending 1", rendered)
         self.assertIn("alana_filler_pending 0", rendered)
         self.assertIn('alana_stream_restarts_total{leg="rtmp",reason="stall"} 1', rendered)
         self.assertIn('alana_rtmp_outputs_configured 2', rendered)
@@ -69,6 +78,8 @@ class MetricsTests(unittest.TestCase):
             self.metrics.observe_command("start", "program-123")
         with self.assertRaises(ValueError):
             self.metrics.observe_preparation("program-123")
+        with self.assertRaises(ValueError):
+            self.metrics.observe_destination("reload", "program-123")
         with self.assertRaises(ValueError):
             record_runtime_event(self.runtime_path, "restart", "rtmp", "https://private.example", 5)
         with self.assertRaises(ValueError):

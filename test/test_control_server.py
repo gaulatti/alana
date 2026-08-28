@@ -18,6 +18,17 @@ control = importlib.util.module_from_spec(spec)
 assert spec.loader
 spec.loader.exec_module(control)
 
+TEST_DESTINATION_SELECTION = {
+    "version": "destinations-v1",
+    "destinations": [
+        {
+            "id": "primary",
+            "secretId": "broadcast/test/primary",
+            "versionId": "version-1",
+        }
+    ],
+}
+
 
 class FakePipeline:
     def __init__(self, events, *, running=False, ready=True):
@@ -29,6 +40,8 @@ class FakePipeline:
         return self.is_running
 
     def start(self):
+        if self.is_running:
+            return
         self.events.append("pipeline:start")
         self.is_running = True
 
@@ -50,14 +63,62 @@ class FakeCroccante:
         self.prepare_answers = list(prepare_answers or [])
         self.status_answers = list(status_answers or [])
 
-    def command(self, action, key, sequence, filler_version=None):
+    def command(
+        self,
+        action,
+        key,
+        sequence,
+        filler_version=None,
+        destination_selection=None,
+    ):
         self.events.append(f"croccante:{action}")
         if self.answers:
             return self.answers.pop(0)
+        metadata = (
+            control.destination_metadata(destination_selection)
+            if destination_selection is not None
+            else None
+        )
         return {
             "accepted": True,
             "requestedState": f"{action}ed",
+            "actualState": f"{action}ed",
             **({"fillerVersion": filler_version} if action == "start" else {}),
+            **(
+                {
+                    "destinationConfiguration": metadata,
+                    "destinations": [
+                        {
+                            "id": item["id"],
+                            "mode": "waiting-for-publisher",
+                            "supervisorHealthy": True,
+                            "publisherProcessHealthy": False,
+                        }
+                        for item in destination_selection["destinations"]
+                    ],
+                }
+                if metadata and destination_selection
+                else {}
+            ),
+        }
+
+    def reload_destinations(self, version, key, selection):
+        self.events.append(f"croccante:reload:{version}")
+        return 200, {
+            "accepted": True,
+            **control.destination_metadata(selection),
+            "result": "validated",
+        }
+
+    def status(self):
+        if self.status_answers:
+            return self.status_answers.pop(0)
+        return 200, {
+            "requestedState": "started",
+            "actualState": "started",
+            "destinationConfiguration": control.destination_metadata(
+                TEST_DESTINATION_SELECTION
+            ),
         }
 
     def prepare(self, version, key, payload):
@@ -110,6 +171,10 @@ class LifecycleTests(unittest.TestCase):
         self.temp.cleanup()
 
     @staticmethod
+    def destination_selection():
+        return json.loads(json.dumps(TEST_DESTINATION_SELECTION))
+
+    @staticmethod
     def filler_payload(command="prepare-one", source="source-one"):
         return {
             "commandId": command,
@@ -132,7 +197,9 @@ class LifecycleTests(unittest.TestCase):
         }
 
     def test_start_waits_for_pipeline_before_croccante(self):
-        status, body = self.manager.command("start", "start-one", 1)
+        status, body = self.manager.command(
+            "start", "start-one", 1, self.destination_selection()
+        )
         self.assertEqual(status, 200)
         self.assertEqual(self.events, ["pipeline:start", "croccante:start"])
         self.assertEqual(body["actualState"], "running")
@@ -141,7 +208,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertIsNone(body["pendingFiller"])
 
     def test_stop_acknowledgement_precedes_pipeline_teardown(self):
-        self.manager.command("start", "start-one", 1)
+        self.manager.command("start", "start-one", 1, self.destination_selection())
         self.events.clear()
         status, body = self.manager.command("stop", "stop-one", 2)
         self.assertEqual(status, 200)
@@ -149,8 +216,10 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(body["actualState"], "stopped")
 
     def test_duplicate_command_is_idempotent(self):
-        first = self.manager.command("start", "same-key", 1)
-        duplicate = self.manager.command("start", "same-key", 1)
+        first = self.manager.command("start", "same-key", 1, self.destination_selection())
+        duplicate = self.manager.command(
+            "start", "same-key", 1, self.destination_selection()
+        )
         self.assertEqual(first[0], 200)
         self.assertEqual(duplicate[0], 200)
         self.assertTrue(duplicate[1]["commandResult"]["duplicate"])
@@ -163,7 +232,9 @@ class LifecycleTests(unittest.TestCase):
             "status": "preparing",
             "ready": False,
         }
-        status, body = self.manager.command("start", "start-unready", 1)
+        status, body = self.manager.command(
+            "start", "start-unready", 1, self.destination_selection()
+        )
         self.assertEqual(status, 409)
         self.assertEqual(body["commandResult"]["result"], "filler-not-ready")
         self.assertEqual(self.events, [])
@@ -177,7 +248,9 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(duplicate[0], 200)
         self.assertTrue(duplicate[1]["duplicate"])
         self.assertEqual(self.events, ["croccante:prepare:filler-v2"])
-        status, body = self.manager.command("start", "start-two", 1)
+        status, body = self.manager.command(
+            "start", "start-two", 1, self.destination_selection()
+        )
         self.assertEqual(status, 200)
         self.assertEqual(
             self.events,
@@ -195,7 +268,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(self.events.count("croccante:prepare:filler-v2"), 1)
 
     def test_active_filler_is_immutable_while_next_version_prepares(self):
-        self.manager.command("start", "start-one", 1)
+        self.manager.command("start", "start-one", 1, self.destination_selection())
         payload = self.filler_payload(command="prepare-two", source="source-two")
         status, _ = self.manager.prepare_filler("filler-v2", "prepare-two", payload)
         self.assertEqual(status, 200)
@@ -240,18 +313,18 @@ class LifecycleTests(unittest.TestCase):
         self.assertTrue(recovered.view()["pendingFiller"]["ready"])
 
     def test_reused_key_for_different_command_is_rejected(self):
-        self.manager.command("start", "same-key", 1)
+        self.manager.command("start", "same-key", 1, self.destination_selection())
         status, body = self.manager.command("stop", "same-key", 2)
         self.assertEqual(status, 409)
         self.assertIn("already used", body["error"])
 
     def test_old_sequence_is_rejected(self):
-        self.manager.command("start", "one", 5)
+        self.manager.command("start", "one", 5, self.destination_selection())
         status, _ = self.manager.command("stop", "two", 4)
         self.assertEqual(status, 409)
 
     def test_failed_stop_keeps_pipeline_and_retries_before_teardown(self):
-        self.manager.command("start", "start", 1)
+        self.manager.command("start", "start", 1, self.destination_selection())
         self.croccante.answers = [
             {"accepted": False, "error": "unavailable"},
             {"accepted": True, "requestedState": "stopped"},
@@ -267,7 +340,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(self.manager.view()["actualState"], "stopped")
 
     def test_publisher_drop_recovers_without_stop_command(self):
-        self.manager.command("start", "start", 1)
+        self.manager.command("start", "start", 1, self.destination_selection())
         self.events.clear()
         self.pipeline.is_running = False
         self.manager.reconcile_once()
@@ -275,7 +348,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(self.manager.view()["actualState"], "running")
 
     def test_restart_recovers_persisted_running_request(self):
-        self.manager.command("start", "start", 1)
+        self.manager.command("start", "start", 1, self.destination_selection())
         recovered_events = []
         recovered = control.LifecycleManager(
             self.store,
@@ -290,7 +363,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(recovered.view()["actualState"], "running")
 
     def test_restart_retries_persisted_stop_before_marking_stopped(self):
-        self.manager.command("start", "start", 1)
+        self.manager.command("start", "start", 1, self.destination_selection())
         self.croccante.answers = [{"accepted": False, "error": "unavailable"}]
         self.manager.command("stop", "stop", 2)
         recovered_events = []
@@ -306,7 +379,7 @@ class LifecycleTests(unittest.TestCase):
 
     def test_state_and_command_records_never_store_key_or_token(self):
         secret = "never-persist-this-secret"
-        self.manager.command("start", secret, 1)
+        self.manager.command("start", secret, 1, self.destination_selection())
         self.manager.prepare_filler("filler-v2", "prepare-two", self.filler_payload(command="prepare-two"))
         persisted = "".join(
             path.read_text() for path in Path(self.temp.name).rglob("*.json")
@@ -318,12 +391,155 @@ class LifecycleTests(unittest.TestCase):
 
     def test_public_state_redacts_pending_downstream_key(self):
         self.croccante.answers = [{"accepted": False, "error": "unavailable"}]
-        self.manager.command("start", "start-secret", 1)
-        pending = self.manager.view()["pendingCroccante"]
-        self.assertEqual(
-            pending,
-            {"action": "start", "sequence": 1, "fillerVersion": "filler-v1"},
+        self.manager.command(
+            "start", "start-secret", 1, self.destination_selection()
         )
+        pending = self.manager.view()["pendingCroccante"]
+        self.assertEqual(pending["action"], "start")
+        self.assertEqual(pending["sequence"], 1)
+        self.assertEqual(pending["fillerVersion"], "filler-v1")
+        self.assertEqual(pending["destinationVersion"], "destinations-v1")
+        self.assertEqual(pending["destinationCount"], 1)
+        self.assertEqual(pending["destinationIds"], ["primary"])
+        self.assertNotIn("key", pending)
+        self.assertNotIn("secretId", json.dumps(pending))
+
+    def test_destination_selection_validation_is_bounded_and_exact(self):
+        one = self.destination_selection()
+        self.assertEqual(control.parse_destination_selection(one), one)
+        many = {
+            "version": "destinations-v20",
+            "destinations": [
+                {
+                    "id": f"destination-{index}",
+                    "secretId": f"broadcast/test/{index}",
+                    "versionId": f"version-{index}",
+                }
+                for index in range(20)
+            ],
+        }
+        self.assertEqual(
+            len(control.parse_destination_selection(many)["destinations"]), 20
+        )
+        for invalid in (
+            {"version": "destinations-empty", "destinations": []},
+            {"version": "destinations-many", "destinations": many["destinations"] * 2},
+            {
+                "version": "destinations-duplicate",
+                "destinations": one["destinations"] * 2,
+            },
+            {
+                "version": "destinations-unknown",
+                "destinations": [{**one["destinations"][0], "url": "rtmp://secret"}],
+            },
+        ):
+            with self.assertRaises(ValueError):
+                control.parse_destination_selection(invalid)
+
+    def test_reload_is_idempotent_and_active_mutation_is_rejected(self):
+        selection = self.destination_selection()
+        first = self.manager.reload_destinations(
+            selection["version"], "reload-one", selection
+        )
+        duplicate = self.manager.reload_destinations(
+            selection["version"], "reload-one", selection
+        )
+        self.assertEqual(first[0], 200)
+        self.assertEqual(duplicate[0], 200)
+        self.assertTrue(duplicate[1]["duplicate"])
+        self.assertEqual(self.events.count("croccante:reload:destinations-v1"), 1)
+        self.manager.command("start", "start-one", 1, selection)
+        status, body = self.manager.reload_destinations(
+            selection["version"], "reload-two", selection
+        )
+        self.assertEqual(status, 409)
+        self.assertIn("stopped", body["error"])
+
+    def test_changed_selection_on_lifecycle_replay_is_rejected(self):
+        selection = self.destination_selection()
+        self.manager.command("start", "start-one", 1, selection)
+        changed = self.destination_selection()
+        changed["destinations"][0]["id"] = "secondary"
+        status, body = self.manager.command("start", "start-one", 1, changed)
+        self.assertEqual(status, 409)
+        self.assertIn("already used", body["error"])
+
+    def test_partial_downstream_rejection_never_reports_running(self):
+        self.croccante.answers = [
+            {
+                "accepted": False,
+                "requestedState": "started",
+                "actualState": "failed",
+                "error": "unexpected-state",
+                "destinations": [
+                    {
+                        "id": "primary",
+                        "mode": "failed",
+                        "supervisorHealthy": False,
+                        "publisherProcessHealthy": False,
+                    }
+                ],
+            }
+        ]
+        status, body = self.manager.command(
+            "start", "start-partial", 1, self.destination_selection()
+        )
+        self.assertEqual(status, 502)
+        self.assertEqual(body["actualState"], "degraded")
+        self.assertNotEqual(body["actualState"], "running")
+
+    def test_restart_reconciles_pending_start_without_persisting_references(self):
+        self.croccante.answers = [{"accepted": False, "error": "unavailable"}]
+        self.manager.command(
+            "start", "start-reconcile", 1, self.destination_selection()
+        )
+        persisted = "".join(
+            path.read_text() for path in Path(self.temp.name).rglob("*.json")
+        )
+        self.assertNotIn("secretId", persisted)
+        self.assertNotIn("broadcast/test/primary", persisted)
+        recovered = control.LifecycleManager(
+            self.store,
+            FakePipeline([], running=True),
+            FakeCroccante([]),
+            start_monitor=False,
+        )
+        recovered.reconcile_once()
+        self.assertEqual(recovered.view()["actualState"], "running")
+        self.assertEqual(
+            recovered.view()["activeDestinations"]["destinationIds"], ["primary"]
+        )
+
+    def test_exact_replay_after_restart_resupplies_unpersisted_references(self):
+        self.croccante.answers = [{"accepted": False, "error": "unavailable"}]
+        selection = self.destination_selection()
+        self.manager.command("start", "start-replay", 1, selection)
+        recovered_events = []
+        downstream = FakeCroccante(
+            recovered_events,
+            status_answers=[
+                (
+                    200,
+                    {
+                        "requestedState": "stopped",
+                        "actualState": "stopped",
+                        "destinationConfiguration": None,
+                    },
+                )
+            ],
+        )
+        recovered = control.LifecycleManager(
+            self.store,
+            FakePipeline(recovered_events, running=True),
+            downstream,
+            start_monitor=False,
+        )
+        recovered.reconcile_once()
+        self.assertEqual(recovered.view()["actualState"], "degraded")
+        status, body = recovered.command("start", "start-replay", 1, selection)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["actualState"], "running")
+        self.assertEqual(recovered_events, ["croccante:start"])
 
     def test_http_api_requires_authentication_and_program_scope(self):
         token_file = Path(self.temp.name) / "control-token"
@@ -373,6 +589,44 @@ class LifecycleTests(unittest.TestCase):
                 prepared = json.loads(response.read())
             self.assertTrue(prepared["ready"])
             self.assertNotIn("downloadUrl", json.dumps(prepared))
+
+            selection = self.destination_selection()
+            reload_body = json.dumps(
+                {"commandId": "reload-http", **selection}
+            ).encode()
+            reload_request = Request(
+                f"{origin}{control.DESTINATION_PATH}{selection['version']}",
+                method="PUT",
+                data=reload_body,
+                headers={
+                    "Authorization": "Bearer api-secret",
+                    "Content-Type": "application/json",
+                    "Idempotency-Key": "reload-http",
+                },
+            )
+            with urlopen(reload_request) as response:
+                reloaded = json.loads(response.read())
+            self.assertEqual(reloaded["destinationIds"], ["primary"])
+            self.assertNotIn("secretId", json.dumps(reloaded))
+
+            start_request = Request(
+                f"{origin}{control.PROGRAM_PATH}/start",
+                method="POST",
+                data=json.dumps(selection).encode(),
+                headers={
+                    "Authorization": "Bearer api-secret",
+                    "Content-Type": "application/json",
+                    "Idempotency-Key": "start-http",
+                    "X-Command-Sequence": "1",
+                },
+            )
+            with urlopen(start_request) as response:
+                started = json.loads(response.read())
+            self.assertEqual(started["actualState"], "running")
+            self.assertEqual(
+                started["activeDestinations"]["destinationIds"], ["primary"]
+            )
+            self.assertNotIn("secretId", json.dumps(started))
 
             filler_status = Request(
                 f"{origin}{control.FILLER_PATH}filler-v2",
@@ -455,6 +709,21 @@ class CroccanteClientContractTests(unittest.TestCase):
                 length = int(self.headers["Content-Length"])
                 payload = json.loads(self.rfile.read(length))
                 requests.append(("PUT", self.path, dict(self.headers), payload))
+                if "/destinations/" in self.path:
+                    selection = {
+                        "version": payload["version"],
+                        "destinations": payload["destinations"],
+                    }
+                    metadata = control.destination_metadata(selection)
+                    self.send_payload(
+                        {
+                            "version": metadata["version"],
+                            "selectionHash": metadata["selectionHash"],
+                            "destinationCount": metadata["count"],
+                            "result": "validated",
+                        }
+                    )
+                    return
                 self.send_payload(
                     {
                         "version": "filler-v9",
@@ -468,14 +737,38 @@ class CroccanteClientContractTests(unittest.TestCase):
                     }
                 )
 
+            def do_GET(self):
+                requests.append(("GET", self.path, dict(self.headers), None))
+                metadata = control.destination_metadata(TEST_DESTINATION_SELECTION)
+                self.send_payload(
+                    {
+                        "requestedState": "started",
+                        "actualState": "started",
+                        "destinationConfiguration": metadata,
+                    }
+                )
+
             def do_POST(self):
-                requests.append(("POST", self.path, dict(self.headers), None))
+                length = int(self.headers.get("Content-Length", "0"))
+                selection = json.loads(self.rfile.read(length)) if length else None
+                requests.append(("POST", self.path, dict(self.headers), selection))
                 version = self.headers.get("X-Filler-Version")
+                metadata = control.destination_metadata(selection)
                 self.send_payload(
                     {
                         "requestedState": "started",
                         "actualState": "started",
                         "sessionId": "safe-session",
+                        "destinationConfiguration": metadata,
+                        "destinations": [
+                            {
+                                "id": item["id"],
+                                "mode": "waiting-for-publisher",
+                                "supervisorHealthy": True,
+                                "publisherProcessHealthy": False,
+                            }
+                            for item in selection["destinations"]
+                        ],
                         "filler": {
                             "version": version,
                             "status": "ready",
@@ -514,7 +807,10 @@ class CroccanteClientContractTests(unittest.TestCase):
         status, prepared = self.client.prepare("filler-v9", "prepare-nine", payload)
         self.assertEqual(status, 200)
         self.assertTrue(prepared["ready"])
-        acknowledgement = self.client.command("start", "start-nine", 9, "filler-v9")
+        selection = json.loads(json.dumps(TEST_DESTINATION_SELECTION))
+        acknowledgement = self.client.command(
+            "start", "start-nine", 9, "filler-v9", selection
+        )
         self.assertTrue(acknowledgement["accepted"])
         self.assertEqual(acknowledgement["fillerVersion"], "filler-v9")
 
@@ -527,7 +823,28 @@ class CroccanteClientContractTests(unittest.TestCase):
         self.assertEqual(start[0:2], ("POST", "/v1/programs/test-program/session/start"))
         self.assertEqual(start[2]["X-Filler-Version"], "filler-v9")
         self.assertEqual(start[2]["X-Command-Sequence"], "9")
+        self.assertEqual(start[3], selection)
         self.assertNotIn("downloadUrl", json.dumps(prepared))
+
+    def test_forwards_stopped_reload_and_reads_redacted_status(self):
+        selection = json.loads(json.dumps(TEST_DESTINATION_SELECTION))
+        status, acknowledgement = self.client.reload_destinations(
+            selection["version"], "reload-nine", selection
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(acknowledgement["accepted"])
+        request = self.requests[0]
+        self.assertEqual(
+            request[0:2],
+            ("PUT", "/v1/programs/test-program/destinations/destinations-v1"),
+        )
+        self.assertEqual(request[2]["Authorization"], "Bearer outbound-secret")
+        self.assertEqual(request[3], {"commandId": "reload-nine", **selection})
+
+        status, state = self.client.status()
+        self.assertEqual(status, 200)
+        self.assertEqual(state["destinationConfiguration"]["count"], 1)
+        self.assertNotIn("secretId", json.dumps(state))
 
 
 if __name__ == "__main__":

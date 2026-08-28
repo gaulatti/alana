@@ -17,15 +17,21 @@ from typing import Iterator
 
 HISTOGRAM_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120)
 HTTP_METHODS = frozenset({"GET", "POST", "PUT", "OTHER"})
-HTTP_ROUTES = frozenset({"metrics", "lifecycle", "filler", "unknown"})
+HTTP_ROUTES = frozenset({"metrics", "lifecycle", "filler", "destinations", "unknown"})
 STATUS_CLASSES = frozenset({"1xx", "2xx", "3xx", "4xx", "5xx", "unknown"})
-DEPENDENCY_OPERATIONS = frozenset({"start", "stop", "prepare", "filler_status"})
+DEPENDENCY_OPERATIONS = frozenset(
+    {"start", "stop", "prepare", "filler_status", "destination_reload", "status"}
+)
 DEPENDENCY_RESULTS = frozenset({"success", "http_error", "unavailable", "invalid_response", "unexpected_state", "token_unavailable"})
 COMMAND_ACTIONS = frozenset({"start", "stop"})
 COMMAND_RESULTS = frozenset({"success", "conflict", "dependency_failure", "not_ready", "failure"})
 RECONCILE_RESULTS = frozenset({"success", "failure"})
 PREPARATION_RESULTS = frozenset(
     {"success", "failure", "conflict", "unavailable", "duplicate", "reconciled", "not_ready"}
+)
+DESTINATION_ACTIONS = frozenset({"reload"})
+DESTINATION_RESULTS = frozenset(
+    {"success", "failure", "conflict", "duplicate", "active"}
 )
 LIFECYCLE_STATES = ("stopped", "starting", "running", "stopping", "degraded", "failed", "transitioning", "unknown")
 RUNTIME_LEGS = frozenset({"browser", "audio", "rtmp", "livekit"})
@@ -178,6 +184,13 @@ class Metrics:
             {"result": PREPARATION_RESULTS},
         )
 
+    def observe_destination(self, action: str, result: str) -> None:
+        self._increment(
+            "alana_destination_operations_total",
+            {"action": action, "result": result},
+            {"action": DESTINATION_ACTIONS, "result": DESTINATION_RESULTS},
+        )
+
     @staticmethod
     def _gauge(lines: list[str], name: str, help_text: str, value: float | int, labels: dict[str, str] | None = None) -> None:
         lines.extend((f"# HELP {name} {help_text}", f"# TYPE {name} gauge", f"{name}{_labels(labels or {})} {value}"))
@@ -216,6 +229,7 @@ class Metrics:
             "alana_lifecycle_commands_total": "Lifecycle commands by bounded action and result.",
             "alana_reconcile_cycles_total": "Lifecycle reconciliation cycles by result.",
             "alana_filler_preparations_total": "Filler preparation and reconciliation outcomes.",
+            "alana_destination_operations_total": "Destination validation and reload outcomes.",
         }
         for (name, label_pairs), value in sorted(counters.items()):
             lines.extend((f"# HELP {name} {counter_help[name]}", f"# TYPE {name} counter", f"{name}{_labels(dict(label_pairs))} {value}"))
@@ -248,6 +262,24 @@ class Metrics:
             "alana_filler_pending_ready",
             "Whether the configured next-session filler version is acknowledged ready.",
             int(isinstance(pending_filler, dict) and pending_filler.get("ready") is True),
+        )
+        active_destinations = snapshot.get("activeDestinations")
+        pending_destinations = snapshot.get("pendingDestinations")
+        self._gauge(
+            lines,
+            "alana_destinations_active",
+            "Opaque destinations bound to the active broadcast.",
+            int(active_destinations.get("count", 0))
+            if isinstance(active_destinations, dict)
+            else 0,
+        )
+        self._gauge(
+            lines,
+            "alana_destinations_pending",
+            "Opaque destinations in the validated next selection.",
+            int(pending_destinations.get("count", 0))
+            if isinstance(pending_destinations, dict)
+            else 0,
         )
 
         with _runtime_lock(self.runtime_path):

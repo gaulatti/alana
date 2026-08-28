@@ -34,9 +34,14 @@ PIPELINE_READY_TIMEOUT = int(os.environ.get("PIPELINE_READY_TIMEOUT", "90"))
 CONTROL_RETRY_SECONDS = int(os.environ.get("CONTROL_RETRY_SECONDS", "5"))
 PROGRAM_PATH = f"/v1/programs/{quote(PROGRAM_ID, safe='')}/lifecycle"
 FILLER_PATH = f"/v1/programs/{quote(PROGRAM_ID, safe='')}/fillers/"
+DESTINATION_PATH = f"/v1/programs/{quote(PROGRAM_ID, safe='')}/destinations/"
 METRICS_PATH = "/metrics"
 METRICS = Metrics()
 FILLER_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
+DESTINATION_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+DESTINATION_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+DESTINATION_SECRET_ID = re.compile(r"^[A-Za-z0-9/_+=,.@:-]{1,512}$")
+MAX_DESTINATIONS = 20
 FILLER_FAILURE_REASONS = frozenset(
     {
         "checksum-mismatch",
@@ -75,6 +80,58 @@ def atomic_json(path: Path, payload: dict[str, object]) -> None:
     os.replace(temporary, path)
 
 
+def parse_destination_selection(
+    payload: object, *, expected_version: str | None = None
+) -> dict[str, object]:
+    """Validate the transport-only Croccante selection without resolving it."""
+    if not isinstance(payload, dict) or set(payload) != {"version", "destinations"}:
+        raise ValueError("invalid destination selection")
+    version = payload.get("version")
+    destinations = payload.get("destinations")
+    if not isinstance(version, str) or not DESTINATION_VERSION.fullmatch(version):
+        raise ValueError("invalid destination version")
+    if expected_version is not None and version != expected_version:
+        raise ValueError("destination version mismatch")
+    if not isinstance(destinations, list) or not 1 <= len(destinations) <= MAX_DESTINATIONS:
+        raise ValueError("invalid destination count")
+
+    normalized: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in destinations:
+        if not isinstance(item, dict) or set(item) != {"id", "secretId", "versionId"}:
+            raise ValueError("invalid destination reference")
+        destination_id = item.get("id")
+        secret_id = item.get("secretId")
+        version_id = item.get("versionId")
+        if (
+            not isinstance(destination_id, str)
+            or not DESTINATION_IDENTIFIER.fullmatch(destination_id)
+            or destination_id in seen
+        ):
+            raise ValueError("invalid or duplicate destination id")
+        if not isinstance(secret_id, str) or not DESTINATION_SECRET_ID.fullmatch(secret_id):
+            raise ValueError("invalid destination secret reference")
+        if not isinstance(version_id, str) or not DESTINATION_VERSION.fullmatch(version_id):
+            raise ValueError("invalid destination secret version")
+        seen.add(destination_id)
+        normalized.append(
+            {"id": destination_id, "secretId": secret_id, "versionId": version_id}
+        )
+    return {"version": version, "destinations": normalized}
+
+
+def destination_metadata(selection: dict[str, object]) -> dict[str, object]:
+    canonical = json.dumps(selection, separators=(",", ":"), sort_keys=True).encode()
+    destinations = selection["destinations"]
+    assert isinstance(destinations, list)
+    return {
+        "version": selection["version"],
+        "selectionHash": hashlib.sha256(canonical).hexdigest(),
+        "count": len(destinations),
+        "destinationIds": [item["id"] for item in destinations if isinstance(item, dict)],
+    }
+
+
 def pid_alive(path: Path) -> bool:
     try:
         os.kill(int(read_text(path)), 0)
@@ -92,8 +149,10 @@ class StateStore:
         self.root = root
         self.state_file = root / "lifecycle.json"
         self.command_dir = root / "commands"
+        self.destination_command_dir = root / "destination-commands"
         self.root.mkdir(parents=True, exist_ok=True)
         self.command_dir.mkdir(exist_ok=True)
+        self.destination_command_dir.mkdir(exist_ok=True)
 
     def initial(self) -> dict[str, object]:
         stamp = now()
@@ -110,6 +169,8 @@ class StateStore:
             "pendingCroccante": None,
             "activeFiller": None,
             "pendingFiller": None,
+            "activeDestinations": None,
+            "pendingDestinations": None,
             "timestamps": {
                 "requestedAt": stamp,
                 "transitionStartedAt": None,
@@ -148,6 +209,18 @@ class StateStore:
 
     def record_command(self, key: str, record: dict[str, object]) -> None:
         atomic_json(self.command_path(key), record)
+
+    def destination_command_path(self, key: str) -> Path:
+        return self.destination_command_dir / f"{self.command_digest(key)}.json"
+
+    def prior_destination_command(self, key: str) -> dict[str, object] | None:
+        try:
+            return json.loads(self.destination_command_path(key).read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return None
+
+    def record_destination_command(self, key: str, record: dict[str, object]) -> None:
+        atomic_json(self.destination_command_path(key), record)
 
 
 class SubprocessPipeline:
@@ -271,6 +344,7 @@ class CroccanteClient:
         key: str,
         sequence: int,
         filler_version: str | None = None,
+        destination_selection: dict[str, object] | None = None,
     ) -> dict[str, object]:
         started = time.monotonic()
 
@@ -284,15 +358,21 @@ class CroccanteClient:
         url = (
             f"{self.base_url}/v1/programs/{quote(PROGRAM_ID, safe='')}/session/{action}"
         )
+        request_body = (
+            json.dumps(destination_selection, separators=(",", ":"), sort_keys=True).encode()
+            if action == "start" and destination_selection is not None
+            else b""
+        )
         request = Request(
             url,
             method="POST",
-            data=b"",
+            data=request_body,
             headers={
                 "Authorization": f"Bearer {token}",
                 "Idempotency-Key": key,
                 "X-Command-Sequence": str(sequence),
                 **({"X-Filler-Version": filler_version} if action == "start" and filler_version else {}),
+                **({"Content-Type": "application/json"} if request_body else {}),
             },
         )
         try:
@@ -313,15 +393,161 @@ class CroccanteClient:
             and filler.get("version") == filler_version
             and filler.get("ready") is True
         )
-        accepted = payload.get("requestedState") == expected and filler_matches
+        expected_destinations = (
+            destination_metadata(destination_selection)
+            if action == "start" and destination_selection is not None
+            else None
+        )
+        configuration = payload.get("destinationConfiguration")
+        destination_states = payload.get("destinations")
+        safe_destinations: list[dict[str, object]] = []
+        if isinstance(destination_states, list):
+            for item in destination_states[:MAX_DESTINATIONS]:
+                if not isinstance(item, dict):
+                    continue
+                destination_id = item.get("id")
+                if not isinstance(destination_id, str) or not DESTINATION_IDENTIFIER.fullmatch(destination_id):
+                    continue
+                safe_destinations.append(
+                    {
+                        "id": destination_id,
+                        "mode": item.get("mode")
+                        if item.get("mode") in {"idle", "waiting-for-publisher", "relaying", "filler", "backoff", "stopping", "failed"}
+                        else "unknown",
+                        "supervisorHealthy": item.get("supervisorHealthy") is True,
+                        "publisherProcessHealthy": item.get("publisherProcessHealthy") is True,
+                    }
+                )
+        destinations_match = action != "start" or bool(
+            expected_destinations
+            and isinstance(configuration, dict)
+            and configuration.get("version") == expected_destinations["version"]
+            and configuration.get("selectionHash") == expected_destinations["selectionHash"]
+            and configuration.get("count") == expected_destinations["count"]
+            and isinstance(destination_states, list)
+            and len(destination_states) == expected_destinations["count"]
+            and [item["id"] for item in safe_destinations]
+            == expected_destinations["destinationIds"]
+        )
+        accepted = (
+            payload.get("requestedState") == expected
+            and (action != "start" or payload.get("actualState") == "started")
+            and filler_matches
+            and destinations_match
+        )
         return finish({
             "accepted": accepted,
             "requestedState": payload.get("requestedState"),
             "actualState": payload.get("actualState"),
             "sessionId": payload.get("sessionId"),
             **({"fillerVersion": filler_version} if accepted and action == "start" else {}),
+            **(
+                {
+                    "destinationConfiguration": expected_destinations,
+                    "destinations": safe_destinations,
+                }
+                if accepted and expected_destinations
+                else {}
+            ),
             **({} if accepted else {"error": "unexpected-state"}),
         }, "success" if accepted else "unexpected_state")
+
+    def reload_destinations(
+        self,
+        version: str,
+        key: str,
+        selection: dict[str, object],
+    ) -> tuple[int, dict[str, object]]:
+        started = time.monotonic()
+        token, failure = self._token("destination_reload", started)
+        if failure:
+            return 503, failure
+        request_payload = {"commandId": key, **selection}
+        request = Request(
+            f"{self.base_url}/v1/programs/{quote(PROGRAM_ID, safe='')}/destinations/{quote(version, safe='')}",
+            method="PUT",
+            data=json.dumps(request_payload, separators=(",", ":"), sort_keys=True).encode(),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "Idempotency-Key": key,
+            },
+        )
+        try:
+            with urlopen(request, timeout=30) as response:
+                payload = json.loads(response.read())
+        except HTTPError as exc:
+            METRICS.observe_dependency("destination_reload", "http_error", time.monotonic() - started)
+            return exc.code, {"accepted": False, "error": f"http-{exc.code}"}
+        except json.JSONDecodeError:
+            METRICS.observe_dependency("destination_reload", "invalid_response", time.monotonic() - started)
+            return 502, {"accepted": False, "error": "unavailable-or-invalid-response"}
+        except (URLError, TimeoutError, OSError):
+            METRICS.observe_dependency("destination_reload", "unavailable", time.monotonic() - started)
+            return 502, {"accepted": False, "error": "unavailable-or-invalid-response"}
+        expected = destination_metadata(selection)
+        accepted = bool(
+            isinstance(payload, dict)
+            and payload.get("version") == expected["version"]
+            and payload.get("selectionHash") == expected["selectionHash"]
+            and payload.get("destinationCount") == expected["count"]
+            and payload.get("result") == "validated"
+        )
+        METRICS.observe_dependency(
+            "destination_reload",
+            "success" if accepted else "unexpected_state",
+            time.monotonic() - started,
+        )
+        return (200 if accepted else 502), {
+            "accepted": accepted,
+            **expected,
+            "result": "validated" if accepted else "unexpected-state",
+        }
+
+    def status(self) -> tuple[int, dict[str, object]]:
+        started = time.monotonic()
+        token, failure = self._token("status", started)
+        if failure:
+            return 503, failure
+        request = Request(
+            f"{self.base_url}/v1/programs/{quote(PROGRAM_ID, safe='')}/session",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        try:
+            with urlopen(request, timeout=5) as response:
+                payload = json.loads(response.read())
+        except HTTPError as exc:
+            METRICS.observe_dependency("status", "http_error", time.monotonic() - started)
+            return exc.code, {"accepted": False, "error": f"http-{exc.code}"}
+        except json.JSONDecodeError:
+            METRICS.observe_dependency("status", "invalid_response", time.monotonic() - started)
+            return 502, {"accepted": False, "error": "unavailable-or-invalid-response"}
+        except (URLError, TimeoutError, OSError):
+            METRICS.observe_dependency("status", "unavailable", time.monotonic() - started)
+            return 502, {"accepted": False, "error": "unavailable-or-invalid-response"}
+        configuration = payload.get("destinationConfiguration")
+        safe_configuration = None
+        if (
+            isinstance(configuration, dict)
+            and isinstance(configuration.get("version"), str)
+            and DESTINATION_VERSION.fullmatch(configuration["version"])
+            and isinstance(configuration.get("selectionHash"), str)
+            and re.fullmatch(r"[0-9a-f]{64}", configuration["selectionHash"])
+            and isinstance(configuration.get("count"), int)
+            and 1 <= configuration["count"] <= MAX_DESTINATIONS
+        ):
+            safe_configuration = {
+                "version": configuration["version"],
+                "selectionHash": configuration["selectionHash"],
+                "count": configuration["count"],
+            }
+        safe = {
+            "requestedState": payload.get("requestedState"),
+            "actualState": payload.get("actualState"),
+            "destinationConfiguration": safe_configuration,
+        }
+        METRICS.observe_dependency("status", "success", time.monotonic() - started)
+        return 200, safe
 
     def prepare(
         self,
@@ -502,6 +728,7 @@ class LifecycleManager:
         self.lock = threading.RLock()
         self.preparation_lock = threading.Lock()
         self.state = store.load()
+        self.transient_destination_selections: dict[str, dict[str, object]] = {}
         self.closed = threading.Event()
         if start_monitor:
             threading.Thread(target=self._monitor, daemon=True).start()
@@ -523,9 +750,28 @@ class LifecycleManager:
                     if pending.get("action") == "start" and pending.get("fillerVersion")
                     else {}
                 ),
+                **(
+                    {
+                        "destinationVersion": pending.get("destinationVersion"),
+                        "destinationSelectionHash": pending.get(
+                            "destinationSelectionHash"
+                        ),
+                        "destinationCount": pending.get("destinationCount"),
+                        "destinationIds": pending.get("destinationIds"),
+                    }
+                    if pending.get("action") == "start"
+                    and pending.get("destinationSelectionHash")
+                    else {}
+                ),
             }
         public["activeFiller"] = self._public_filler(self.state.get("activeFiller"))
         public["pendingFiller"] = self._public_filler(self.state.get("pendingFiller"))
+        public["activeDestinations"] = self._public_destinations(
+            self.state.get("activeDestinations")
+        )
+        public["pendingDestinations"] = self._public_destinations(
+            self.state.get("pendingDestinations")
+        )
         return {**public, **self.pipeline.status()}
 
     @staticmethod
@@ -545,6 +791,77 @@ class LifecycleManager:
             "error",
         }
         return {key: item for key, item in value.items() if key in allowed}
+
+    @staticmethod
+    def _public_destinations(value: object) -> dict[str, object] | None:
+        if not isinstance(value, dict):
+            return None
+        allowed = {"version", "selectionHash", "count", "destinationIds"}
+        return {key: item for key, item in value.items() if key in allowed}
+
+    def reload_destinations(
+        self,
+        version: str,
+        key: str,
+        selection: dict[str, object],
+    ) -> tuple[int, dict[str, object]]:
+        metadata = destination_metadata(selection)
+        with self.lock:
+            if (
+                self.state.get("requestedState") != "stopped"
+                or self.state.get("actualState") != "stopped"
+                or self.pipeline.running()
+            ):
+                METRICS.observe_destination("reload", "active")
+                return 409, {
+                    **self.view(),
+                    "error": "destination reconfiguration requires a stopped broadcast",
+                }
+            prior = self.store.prior_destination_command(key)
+            if prior:
+                if (
+                    prior.get("version") != version
+                    or prior.get("selectionHash") != metadata["selectionHash"]
+                ):
+                    METRICS.observe_destination("reload", "conflict")
+                    return 409, {
+                        **self.view(),
+                        "error": "idempotency key was already used for another destination selection",
+                    }
+                METRICS.observe_destination("reload", "duplicate")
+                return int(prior["status"]), {**prior, "duplicate": True}
+            for slot in ("activeDestinations", "pendingDestinations"):
+                existing = self.state.get(slot)
+                if (
+                    isinstance(existing, dict)
+                    and existing.get("version") == version
+                    and existing.get("selectionHash") != metadata["selectionHash"]
+                ):
+                    METRICS.observe_destination("reload", "conflict")
+                    return 409, {
+                        **self.view(),
+                        "error": "destination version is already bound to another selection",
+                    }
+
+            status, acknowledgement = self.croccante.reload_destinations(
+                version, self._downstream_key(key), selection
+            )
+            record = {
+                "id": self.store.command_digest(key)[:16],
+                **metadata,
+                "result": "validated" if status < 300 and acknowledgement.get("accepted") else "rejected",
+                "status": status,
+                "acceptedAt": now(),
+            }
+            self.store.record_destination_command(key, record)
+            if status < 300 and acknowledgement.get("accepted"):
+                self.state["pendingDestinations"] = metadata
+                self.transient_destination_selections[str(metadata["selectionHash"])] = selection
+                self._save()
+                METRICS.observe_destination("reload", "success")
+            else:
+                METRICS.observe_destination("reload", "failure")
+            return status, record
 
     @staticmethod
     def _filler_digest(payload: dict[str, object]) -> str:
@@ -658,14 +975,31 @@ class LifecycleManager:
             self.sleep(0.2)
         return False
 
+    @staticmethod
+    def _downstream_matches(
+        payload: dict[str, object], destination: dict[str, object]
+    ) -> bool:
+        configuration = payload.get("destinationConfiguration")
+        return bool(
+            payload.get("requestedState") == "started"
+            and payload.get("actualState") == "started"
+            and isinstance(configuration, dict)
+            and configuration.get("version") == destination.get("version")
+            and configuration.get("selectionHash") == destination.get("selectionHash")
+            and configuration.get("count") == destination.get("count")
+        )
+
     def _acknowledge(
         self,
         action: str,
         key: str,
         sequence: int,
         filler_version: str | None = None,
+        destination_selection: dict[str, object] | None = None,
     ) -> dict[str, object]:
-        return self.croccante.command(action, key, sequence, filler_version)
+        return self.croccante.command(
+            action, key, sequence, filler_version, destination_selection
+        )
 
     def _finish_command(
         self,
@@ -674,6 +1008,7 @@ class LifecycleManager:
         sequence: int,
         result: str,
         status: int,
+        destination: dict[str, object] | None = None,
     ) -> tuple[int, dict[str, object]]:
         record = {
             "id": self.store.command_digest(original_key)[:16],
@@ -682,6 +1017,15 @@ class LifecycleManager:
             "result": result,
             "acceptedAt": now(),
             "status": status,
+            **(
+                {
+                    "destinationVersion": destination["version"],
+                    "destinationSelectionHash": destination["selectionHash"],
+                    "destinationCount": destination["count"],
+                }
+                if destination
+                else {}
+            ),
         }
         self.state["lastSequence"] = sequence
         self.state["lastCommand"] = record
@@ -690,22 +1034,45 @@ class LifecycleManager:
         return status, {**self.view(), "commandResult": record}
 
     def command(
-        self, action: str, key: str, sequence: int
+        self,
+        action: str,
+        key: str,
+        sequence: int,
+        destination_selection: dict[str, object] | None = None,
     ) -> tuple[int, dict[str, object]]:
         with self.lock:
+            destination = (
+                destination_metadata(destination_selection)
+                if destination_selection is not None
+                else None
+            )
             prior = self.store.prior_command(key)
+            retry_recoverable = False
             if prior:
-                if prior.get("action") != action or int(prior["sequence"]) != sequence:
+                if (
+                    prior.get("action") != action
+                    or int(prior["sequence"]) != sequence
+                    or prior.get("destinationSelectionHash")
+                    != (destination["selectionHash"] if destination else None)
+                ):
                     return 409, {
                         **self.view(),
                         "error": "idempotency key was already used for another command",
                     }
-                return int(prior["status"]), {
-                    **self.view(),
-                    "commandResult": {**prior, "duplicate": True},
-                }
+                pending = self.state.get("pendingCroccante")
+                retry_recoverable = bool(
+                    int(prior["status"]) in (502, 503)
+                    and isinstance(pending, dict)
+                    and pending.get("action") == action
+                    and int(pending.get("sequence") or 0) == sequence
+                )
+                if not retry_recoverable:
+                    return int(prior["status"]), {
+                        **self.view(),
+                        "commandResult": {**prior, "duplicate": True},
+                    }
 
-            if sequence <= int(self.state.get("lastSequence") or 0):
+            if not retry_recoverable and sequence <= int(self.state.get("lastSequence") or 0):
                 return 409, {
                     **self.view(),
                     "error": "command sequence is not newer than the last accepted command",
@@ -715,22 +1082,62 @@ class LifecycleManager:
                 return 409, {**self.view(), "error": "a lifecycle transition is already active"}
 
             if action == "start":
-                return self._start(key, sequence)
+                if destination_selection is None or destination is None:
+                    return self._finish_command(
+                        key, "start", sequence, "destinations-required", 400
+                    )
+                self.transient_destination_selections[
+                    str(destination["selectionHash"])
+                ] = destination_selection
+                return self._start(key, sequence, destination_selection, destination)
+            if destination_selection is not None:
+                return self._finish_command(
+                    key, "stop", sequence, "destinations-not-allowed", 400
+                )
             return self._stop(key, sequence)
 
-    def _start(self, key: str, sequence: int) -> tuple[int, dict[str, object]]:
+    def _start(
+        self,
+        key: str,
+        sequence: int,
+        destination_selection: dict[str, object],
+        destination: dict[str, object],
+    ) -> tuple[int, dict[str, object]]:
         if (
             self.state.get("requestedState") == "running"
             and self.state.get("actualState") == "running"
         ):
-            return self._finish_command(key, "start", sequence, "already-running", 200)
+            active_destination = self.state.get("activeDestinations")
+            if (
+                not isinstance(active_destination, dict)
+                or active_destination.get("selectionHash") != destination["selectionHash"]
+            ):
+                return self._finish_command(
+                    key, "start", sequence, "active-destinations-conflict", 409, destination
+                )
+            return self._finish_command(
+                key, "start", sequence, "already-running", 200, destination
+            )
+
+        pending_destination = self.state.get("pendingDestinations")
+        if (
+            isinstance(pending_destination, dict)
+            and pending_destination.get("selectionHash") != destination["selectionHash"]
+        ):
+            return self._finish_command(
+                key, "start", sequence, "pending-destinations-conflict", 409, destination
+            )
 
         pending_filler = self.state.get("pendingFiller")
         if not isinstance(pending_filler, dict) or pending_filler.get("ready") is not True:
-            return self._finish_command(key, "start", sequence, "filler-not-ready", 409)
+            return self._finish_command(
+                key, "start", sequence, "filler-not-ready", 409, destination
+            )
         filler_version = str(pending_filler.get("version") or "")
         if not FILLER_IDENTIFIER.fullmatch(filler_version):
-            return self._finish_command(key, "start", sequence, "filler-not-ready", 409)
+            return self._finish_command(
+                key, "start", sequence, "filler-not-ready", 409, destination
+            )
 
         self._set_transition("running", "transitioning", "starting")
         downstream_key = self._downstream_key(key)
@@ -739,22 +1146,33 @@ class LifecycleManager:
             "key": downstream_key,
             "sequence": sequence,
             "fillerVersion": filler_version,
+            "destinationVersion": destination["version"],
+            "destinationSelectionHash": destination["selectionHash"],
+            "destinationCount": destination["count"],
+            "destinationIds": destination["destinationIds"],
         }
         self._save()
         self.pipeline.start()
         if not self._wait_ready():
             self.state.update(actualState="failed", transition=None, readiness=False)
-            return self._finish_command(key, "start", sequence, "pipeline-not-ready", 503)
+            return self._finish_command(
+                key, "start", sequence, "pipeline-not-ready", 503, destination
+            )
 
         self.state["readiness"] = True
         acknowledgement = self._acknowledge(
-            "start", downstream_key, sequence, filler_version
+            "start",
+            downstream_key,
+            sequence,
+            filler_version,
+            destination_selection,
         )
         self.state["croccanteAcknowledgement"] = acknowledgement
         if not acknowledgement.get("accepted"):
             self.state.update(actualState="degraded", transition=None)
             return self._finish_command(
                 key, "start", sequence, "croccante-start-unacknowledged", 502
+                , destination
             )
 
         timestamps = dict(self.state.get("timestamps") or {})
@@ -766,9 +1184,13 @@ class LifecycleManager:
             pendingCroccante=None,
             activeFiller=pending_filler,
             pendingFiller=None,
+            activeDestinations=destination,
+            pendingDestinations=None,
             timestamps=timestamps,
         )
-        return self._finish_command(key, "start", sequence, "running", 200)
+        return self._finish_command(
+            key, "start", sequence, "running", 200, destination
+        )
 
     def _stop(self, key: str, sequence: int) -> tuple[int, dict[str, object]]:
         if (
@@ -794,6 +1216,8 @@ class LifecycleManager:
         self.pipeline.stop()
         active_filler = self.state.get("activeFiller")
         pending_filler = self.state.get("pendingFiller")
+        active_destinations = self.state.get("activeDestinations")
+        pending_destinations = self.state.get("pendingDestinations")
         timestamps = dict(self.state.get("timestamps") or {})
         timestamps["stoppedAt"] = now()
         self.state.update(
@@ -808,6 +1232,14 @@ class LifecycleManager:
                 if isinstance(pending_filler, dict)
                 else active_filler
                 if isinstance(active_filler, dict)
+                else None
+            ),
+            activeDestinations=None,
+            pendingDestinations=(
+                pending_destinations
+                if isinstance(pending_destinations, dict)
+                else active_destinations
+                if isinstance(active_destinations, dict)
                 else None
             ),
             timestamps=timestamps,
@@ -852,12 +1284,31 @@ class LifecycleManager:
                     return
                 if isinstance(pending, dict) and pending.get("action") == "start":
                     filler_version = str(pending.get("fillerVersion") or "")
-                    ack = self._acknowledge(
-                        "start",
-                        str(pending["key"]),
-                        int(pending["sequence"]),
-                        filler_version,
+                    destination = {
+                        "version": pending.get("destinationVersion"),
+                        "selectionHash": pending.get("destinationSelectionHash"),
+                        "count": pending.get("destinationCount"),
+                        "destinationIds": pending.get("destinationIds"),
+                    }
+                    selection = self.transient_destination_selections.get(
+                        str(destination["selectionHash"])
                     )
+                    if selection is not None:
+                        ack = self._acknowledge(
+                            "start",
+                            str(pending["key"]),
+                            int(pending["sequence"]),
+                            filler_version,
+                            selection,
+                        )
+                    else:
+                        _, downstream = self.croccante.status()
+                        ack = {
+                            "accepted": self._downstream_matches(
+                                downstream, destination
+                            ),
+                            **downstream,
+                        }
                     self.state["croccanteAcknowledgement"] = ack
                     if ack.get("accepted"):
                         prepared = self.state.get("pendingFiller")
@@ -877,8 +1328,20 @@ class LifecycleManager:
                                 and prepared.get("version") == filler_version
                                 else prepared
                             ),
+                            activeDestinations=destination,
+                            pendingDestinations=None,
                         )
+                    else:
+                        self.state.update(actualState="degraded", transition=None)
                 elif self.state.get("actualState") == "degraded":
+                    active_destination = self.state.get("activeDestinations")
+                    if isinstance(active_destination, dict):
+                        _, downstream = self.croccante.status()
+                        if not self._downstream_matches(
+                            downstream, active_destination
+                        ):
+                            self._save()
+                            return
                     self.state["actualState"] = "running"
                 self._save()
                 return
@@ -898,6 +1361,8 @@ class LifecycleManager:
                 self.pipeline.stop()
             active_filler = self.state.get("activeFiller")
             pending_filler = self.state.get("pendingFiller")
+            active_destinations = self.state.get("activeDestinations")
+            pending_destinations = self.state.get("pendingDestinations")
             timestamps = dict(self.state.get("timestamps") or {})
             timestamps["stoppedAt"] = now()
             self.state.update(
@@ -912,6 +1377,14 @@ class LifecycleManager:
                     if isinstance(pending_filler, dict)
                     else active_filler
                     if isinstance(active_filler, dict)
+                    else None
+                ),
+                activeDestinations=None,
+                pendingDestinations=(
+                    pending_destinations
+                    if isinstance(pending_destinations, dict)
+                    else active_destinations
+                    if isinstance(active_destinations, dict)
                     else None
                 ),
                 timestamps=timestamps,
@@ -948,6 +1421,8 @@ class Handler(BaseHTTPRequestHandler):
         route = (
             "metrics"
             if path == METRICS_PATH
+            else "destinations"
+            if "/destinations/" in path
             else "filler"
             if "/fillers/" in path
             else "lifecycle"
@@ -1001,7 +1476,7 @@ class Handler(BaseHTTPRequestHandler):
         started = time.monotonic()
         self.response_status = 500
         path = urlsplit(self.path).path
-        route = "metrics" if path == METRICS_PATH else "filler" if "/fillers/" in path else "lifecycle" if path.startswith("/v1/programs/") else "unknown"
+        route = "metrics" if path == METRICS_PATH else "destinations" if "/destinations/" in path else "filler" if "/fillers/" in path else "lifecycle" if path.startswith("/v1/programs/") else "unknown"
         try:
             if path == METRICS_PATH:
                 if self.authorize():
@@ -1028,9 +1503,48 @@ class Handler(BaseHTTPRequestHandler):
         started = time.monotonic()
         self.response_status = 500
         path = urlsplit(self.path).path
-        route = "filler" if "/fillers/" in path else "unknown"
+        route = "destinations" if "/destinations/" in path else "filler" if "/fillers/" in path else "unknown"
         try:
             if not self.authorize_and_scope():
+                return
+            if path.startswith(DESTINATION_PATH):
+                version = unquote(path[len(DESTINATION_PATH) :])
+                if not DESTINATION_VERSION.fullmatch(version):
+                    self.send_json(404, {"error": "not found"})
+                    return
+                key = self.headers.get("Idempotency-Key", "").strip()
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                except ValueError:
+                    length = 0
+                if not key or len(key) > 200 or length < 2 or length > 65536:
+                    self.send_json(
+                        400,
+                        {"error": "bounded body and Idempotency-Key are required"},
+                    )
+                    return
+                try:
+                    payload = json.loads(self.rfile.read(length))
+                    if (
+                        not isinstance(payload, dict)
+                        or set(payload) != {"commandId", "version", "destinations"}
+                        or payload.get("commandId") != key
+                    ):
+                        raise ValueError
+                    selection = parse_destination_selection(
+                        {
+                            "version": payload["version"],
+                            "destinations": payload["destinations"],
+                        },
+                        expected_version=version,
+                    )
+                except (json.JSONDecodeError, ValueError):
+                    self.send_json(400, {"error": "invalid destination selection"})
+                    return
+                status, result = manager().reload_destinations(
+                    version, key, selection
+                )
+                self.send_json(status, result)
                 return
             if not path.startswith(FILLER_PATH):
                 self.send_json(404, {"error": "not found"})
@@ -1083,7 +1597,30 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": "X-Command-Sequence must be a positive integer"})
                 return
             action = path.rsplit("/", 1)[1]
-            status, payload = manager().command(action, key, sequence)
+            selection = None
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = 0
+            if action == "start":
+                if length < 2 or length > 65536:
+                    self.send_json(
+                        400, {"error": "a bounded destination selection is required"}
+                    )
+                    return
+                try:
+                    selection = parse_destination_selection(
+                        json.loads(self.rfile.read(length))
+                    )
+                except (json.JSONDecodeError, ValueError):
+                    self.send_json(400, {"error": "invalid destination selection"})
+                    return
+            elif length:
+                self.send_json(400, {"error": "Stop does not accept a request body"})
+                return
+            status, payload = manager().command(
+                action, key, sequence, selection
+            )
             command_result = "success" if status < 300 else "conflict" if status == 409 else "dependency_failure" if status == 502 else "not_ready" if status == 503 else "failure"
             METRICS.observe_command(action, command_result)
             self.send_json(status, payload)
