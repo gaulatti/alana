@@ -16,7 +16,9 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from contextlib import contextmanager
 from datetime import datetime, timezone
+from fractions import Fraction
 from pathlib import Path
 
 RECORDING_STATES = frozenset(
@@ -150,6 +152,7 @@ class RecordingStore:
     def __init__(self, root: Path):
         self.root = root
         self.state_file = root / "state.json"
+        self.state_lock_file = root / ".state.lock"
         self.command_dir = root / "commands"
         self.operations_dir = root / "operations"
         self.root.mkdir(parents=True, exist_ok=True)
@@ -216,9 +219,41 @@ class RecordingStore:
             state["state"] = "disabled"
         return state
 
-    def save(self, state: dict[str, object]) -> None:
+    @contextmanager
+    def _state_lock(self):
+        with self.state_lock_file.open("a+", encoding="utf-8") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+
+    def _save_unlocked(self, state: dict[str, object]) -> None:
         state["updatedAt"] = now()
         atomic_json(self.state_file, state)
+
+    def save(self, state: dict[str, object]) -> None:
+        with self._state_lock():
+            self._save_unlocked(state)
+
+    def save_active_progress(self, state: dict[str, object]) -> bool:
+        """Save capture progress without overwriting a newer lifecycle transition."""
+        with self._state_lock():
+            current = read_json(self.state_file)
+            active_states = {"requested", "active"}
+            if (
+                state.get("state") in active_states
+                and current is not None
+                and (
+                    current.get("operationId") != state.get("operationId")
+                    or current.get("state") not in active_states
+                )
+            ):
+                state.clear()
+                state.update(current)
+                return False
+            self._save_unlocked(state)
+            return True
 
     @staticmethod
     def public(state: dict[str, object]) -> dict[str, object]:
@@ -237,7 +272,7 @@ class RecordingStore:
 
 def disk_snapshot(root: Path, quota_bytes: int, min_free_bytes: int) -> dict[str, object]:
     usage = shutil.disk_usage(root)
-    stored = tree_size(root / "operations")
+    stored = tree_size(root)
     return {
         "healthy": usage.free >= min_free_bytes and stored < quota_bytes,
         "freeBytes": usage.free,
@@ -362,7 +397,10 @@ def refresh_summary(store: RecordingStore, state: dict[str, object], records: li
             "audioChannels",
         ):
             state[key] = latest.get(key)
-    store.save(state)
+    if state.get("state") in {"requested", "active"}:
+        store.save_active_progress(state)
+    else:
+        store.save(state)
 
 
 def harvest_segments(
@@ -469,6 +507,13 @@ def capture_command(
                 "stream_out.monitor",
             ]
         )
+    try:
+        capture_rate = Fraction(fps)
+    except (ValueError, ZeroDivisionError) as exc:
+        raise ValueError("FPS must be a positive frame rate") from exc
+    if capture_rate <= 0:
+        raise ValueError("FPS must be a positive frame rate")
+    gop_size = max(1, round(capture_rate * segment_seconds))
     command.extend(
         [
             "-map",
@@ -484,7 +529,7 @@ def capture_command(
             "-b:v",
             video_bitrate,
             "-g",
-            str(max(1, int(fps) * segment_seconds)),
+            str(gop_size),
             "-sc_threshold",
             "0",
             "-force_key_frames",
@@ -724,6 +769,7 @@ def run_supervisor(root: Path, operation_id: str, *, synthetic: bool = False) ->
         )
         process = subprocess.Popen(
             command,
+            shell=False,
             env=capture_environment(),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -735,7 +781,12 @@ def run_supervisor(root: Path, operation_id: str, *, synthetic: bool = False) ->
             supervisorPid=os.getpid(),
             workerPid=process.pid,
         )
-        store.save(state)
+        if not store.save_active_progress(state):
+            terminate_process(process)
+            if state.get("state") == "finalizing":
+                state["stoppedAt"] = state.get("stoppedAt") or now()
+                return 0 if finalize_recording(store, state) else 1
+            return 2
         log_event("capture", "active", "started", int(state.get("restarts", 0)))
         disk_failure: str | None = None
         while process.poll() is None and not shutdown.wait(0.25):
@@ -754,6 +805,9 @@ def run_supervisor(root: Path, operation_id: str, *, synthetic: bool = False) ->
                 disk_failure = "manifest-corrupt"
                 terminate_process(process)
                 break
+            if state.get("state") == "finalizing":
+                terminate_process(process)
+                break
             state["droppedFrames"] = dropped_base + read_dropped_frames(progress)
             disk = disk_snapshot(root, quota_bytes, min_free_bytes)
             state["disk"] = disk
@@ -764,7 +818,9 @@ def run_supervisor(root: Path, operation_id: str, *, synthetic: bool = False) ->
                 disk_failure = "quota-exhausted"
                 terminate_process(process)
             else:
-                store.save(state)
+                if not store.save_active_progress(state):
+                    terminate_process(process)
+                    break
 
         if process.poll() is None:
             terminate_process(process)
@@ -774,9 +830,22 @@ def run_supervisor(root: Path, operation_id: str, *, synthetic: bool = False) ->
             dropped_base + read_dropped_frames(progress),
         )
         state["droppedFrames"] = dropped_base
-        harvest_segments(store, state, include_latest=True)
+        try:
+            harvest_segments(store, state, include_latest=True)
+        except ValueError:
+            state.update(
+                state="failed",
+                finalizationState="failed",
+                error="manifest-corrupt",
+                errors=int(state.get("errors", 0)) + 1,
+                workerPid=None,
+                supervisorPid=None,
+            )
+            store.save(state)
+            log_event("manifest", "failed", "corrupt", int(state["errors"]))
+            return 1
         state["workerPid"] = None
-        store.save(state)
+        store.save_active_progress(state)
         current = store.load(enabled=True)
         if current.get("state") == "finalizing":
             current["stoppedAt"] = current.get("stoppedAt") or now()
@@ -863,6 +932,7 @@ class RecordingController:
             command.append("--synthetic")
         self.process = subprocess.Popen(
             command,
+            shell=False,
             start_new_session=True,
         )
 
@@ -1058,6 +1128,7 @@ def synthetic_smoke(root: Path, seconds: int, segment_seconds: int) -> dict[str,
             synthetic=True,
             duration=seconds,
         ),
+        shell=False,
         env=capture_environment(),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,

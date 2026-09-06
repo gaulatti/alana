@@ -151,7 +151,8 @@ persisted Requested/Active operation. An explicit Stop changes state to
 Finalizing, verifies every segment checksum, remuxes without transcoding, probes
 the MP4, and reports Complete only with its final checksum and media metadata.
 
-Free space and retained bytes are checked before Start and while recording.
+Free space and all retained bytes below the recording root, including state and
+idempotency command records, are checked before Start and while recording.
 Crossing the reserve or quota stops only the recorder and reports the bounded
 `disk-exhausted` or `quota-exhausted` failure. Before a new Start, completed or
 failed operation directories older than `RECORDING_RETENTION_HOURS` are removed.
@@ -277,7 +278,7 @@ Video and recovery:
 | Variable | Default |
 | --- | --- |
 | `RESOLUTION` | `1920x1080` |
-| `FPS` | `30` |
+| `FPS` | `30` (integer, decimal, or rational FFmpeg frame rate) |
 | `VIDEO_ENCODER` | `libx264` |
 | `X264_PRESET` | `veryfast` |
 | `VIDEO_BITRATE` / `VIDEO_MAXRATE` | `6000k` |

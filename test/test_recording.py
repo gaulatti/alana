@@ -7,15 +7,18 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from recording import (
     RecordingController,
     RecordingStore,
     capture_command,
     cleanup_retention,
+    disk_snapshot,
+    harvest_segments,
     manifest_records,
     next_sequence,
+    run_supervisor,
     synthetic_smoke,
 )
 
@@ -40,6 +43,85 @@ class RecordingContractTests(unittest.TestCase):
         self.assertIn("-segment_start_number 7", rendered)
         self.assertNotIn("rtmp://", rendered)
         self.assertNotIn("livekit", rendered.lower())
+
+    def test_capture_calculates_gop_for_fractional_frame_rate(self):
+        with patch.dict(os.environ, {"FPS": "30000/1001"}, clear=False):
+            command = capture_command(self.root, 0, 5)
+
+        self.assertEqual(command[command.index("-g") + 1], "150")
+
+    def test_recording_quota_counts_all_retained_state(self):
+        store = RecordingStore(self.root)
+        (store.operations_dir / "retained").write_bytes(b"operation")
+        (store.command_dir / "retained.json").write_bytes(b"command")
+        store.state_file.write_bytes(b"state")
+
+        snapshot = disk_snapshot(self.root, quota_bytes=10, min_free_bytes=1)
+
+        self.assertEqual(snapshot["usageBytes"], 21)
+        self.assertFalse(snapshot["healthy"])
+
+    def test_capture_progress_does_not_overwrite_stop_transition(self):
+        store = RecordingStore(self.root)
+        operation_id = "a" * 16
+        store.operation_dir(operation_id).mkdir()
+        active = {
+            "enabled": True,
+            "state": "active",
+            "operationId": operation_id,
+            "segmentCount": 0,
+            "bytes": 0,
+            "durationSeconds": 0.0,
+        }
+        store.save(active)
+        stale_capture_state = dict(active)
+        finalizing = {**active, "state": "finalizing", "finalizationState": "pending"}
+        store.save(finalizing)
+
+        harvest_segments(store, stale_capture_state, include_latest=True)
+
+        self.assertEqual(stale_capture_state["state"], "finalizing")
+        self.assertEqual(store.load(enabled=True)["state"], "finalizing")
+
+    def test_post_capture_manifest_corruption_persists_failed_state(self):
+        store = RecordingStore(self.root)
+        operation_id = "b" * 16
+        store.operation_dir(operation_id).mkdir()
+        store.save(
+            {
+                "enabled": True,
+                "state": "requested",
+                "operationId": operation_id,
+                "segmentCount": 0,
+                "bytes": 0,
+                "durationSeconds": 0.0,
+                "droppedFrames": 0,
+                "errors": 0,
+                "restarts": 0,
+                "finalizationState": "not-requested",
+            }
+        )
+        process = Mock()
+        process.pid = 123
+        process.poll.return_value = 1
+        environment = {
+            "PULSE_SERVER": "test",
+            "RECORDING_QUOTA_BYTES": str(2**63 - 1),
+            "RECORDING_MIN_FREE_BYTES": "1",
+        }
+
+        with (
+            patch.dict(os.environ, environment, clear=False),
+            patch("recording.harvest_segments", side_effect=[[], ValueError("corrupt")]),
+            patch("recording.subprocess.Popen", return_value=process),
+        ):
+            result = run_supervisor(self.root, operation_id)
+
+        state = store.load(enabled=True)
+        self.assertEqual(result, 1)
+        self.assertEqual(state["state"], "failed")
+        self.assertEqual(state["error"], "manifest-corrupt")
+        self.assertEqual(state["finalizationState"], "failed")
 
     def test_public_state_omits_processes_and_paths(self):
         state = {
