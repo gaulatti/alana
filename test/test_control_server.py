@@ -56,6 +56,44 @@ class FakePipeline:
         self.is_running = False
 
 
+class FakeRecording:
+    def __init__(self):
+        self.state = {"enabled": True, "state": "idle", "operationId": None}
+        self.commands = {}
+
+    def status(self):
+        return dict(self.state)
+
+    def command(self, action, key):
+        prior = self.commands.get(key)
+        if prior:
+            return prior[0], {**self.state, "commandResult": {**prior[1], "duplicate": True}}
+        if action == "start":
+            self.state = {
+                "enabled": True,
+                "state": "active",
+                "operationId": "a" * 16,
+                "segmentCount": 0,
+                "bytes": 0,
+                "droppedFrames": 0,
+                "errors": 0,
+                "restarts": 0,
+                "finalizationState": "not-requested",
+            }
+            status, result = 202, "accepted"
+        else:
+            self.state = {
+                **self.state,
+                "state": "complete",
+                "finalizationState": "verified",
+                "finalSha256": "b" * 64,
+            }
+            status, result = 200, "complete"
+        record = {"action": action, "status": status, "result": result}
+        self.commands[key] = (status, record)
+        return status, {**self.state, "commandResult": record}
+
+
 class FakeCroccante:
     def __init__(self, events, answers=None, prepare_answers=None, status_answers=None):
         self.events = events
@@ -546,6 +584,7 @@ class LifecycleTests(unittest.TestCase):
         token_file.write_text("api-secret\n")
         control.CONTROL_TOKEN_FILE = token_file
         control.MANAGER = self.manager
+        control.RECORDER = FakeRecording()
         server = control.ThreadingHTTPServer(("127.0.0.1", 0), control.Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -562,6 +601,44 @@ class LifecycleTests(unittest.TestCase):
             )
             with urlopen(request) as response:
                 self.assertEqual(response.status, 200)
+
+            recording_status = Request(
+                f"{origin}{control.RECORDING_PATH}",
+                headers={"Authorization": "Bearer api-secret"},
+            )
+            with urlopen(recording_status) as response:
+                self.assertEqual(json.loads(response.read())["state"], "idle")
+
+            recording_start = Request(
+                f"{origin}{control.RECORDING_PATH}/start",
+                method="POST",
+                headers={
+                    "Authorization": "Bearer api-secret",
+                    "Idempotency-Key": "record-http",
+                },
+            )
+            with urlopen(recording_start) as response:
+                self.assertEqual(response.status, 202)
+                recording = json.loads(response.read())
+            self.assertEqual(recording["state"], "active")
+            self.assertNotIn("path", json.dumps(recording))
+
+            recording_stop = Request(
+                f"{origin}{control.RECORDING_PATH}/stop",
+                method="POST",
+                headers={
+                    "Authorization": "Bearer api-secret",
+                    "Idempotency-Key": "record-stop-http",
+                },
+            )
+            with urlopen(recording_stop) as response:
+                recording = json.loads(response.read())
+            self.assertEqual(recording["state"], "complete")
+            self.assertEqual(recording["finalizationState"], "verified")
+
+            with urlopen(recording_stop) as response:
+                duplicate_recording = json.loads(response.read())
+            self.assertTrue(duplicate_recording["commandResult"]["duplicate"])
 
             filler_body = json.dumps(self.filler_payload()).encode()
             unauthorized_filler = Request(
@@ -653,6 +730,7 @@ class LifecycleTests(unittest.TestCase):
                 metrics = response.read().decode()
             self.assertIn("alana_service_info", metrics)
             self.assertIn("alana_lifecycle_state", metrics)
+            self.assertIn("alana_recording_state", metrics)
             self.assertNotIn("test-program", metrics)
             self.assertNotIn("api-secret", metrics)
 

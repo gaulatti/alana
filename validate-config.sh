@@ -50,6 +50,28 @@ case "${ALLOW_SOFTWARE_FALLBACK:-0}" in
     *) fail "ALLOW_SOFTWARE_FALLBACK must be 0 or 1" ;;
 esac
 
+case "${RECORDING_ENABLED:-0}" in
+    0|1) ;;
+    *) fail "RECORDING_ENABLED must be 0 or 1" ;;
+esac
+
+for setting in RECORDING_SEGMENT_SECONDS:5 RECORDING_QUOTA_BYTES:53687091200 \
+    RECORDING_MIN_FREE_BYTES:1073741824 RECORDING_RETENTION_HOURS:168 \
+    RECORDING_MAX_RESTARTS:5 RECORDING_RESTART_BACKOFF_SECONDS:2 \
+    RECORDING_START_TIMEOUT:10 RECORDING_FINALIZE_TIMEOUT:120; do
+    name="${setting%%:*}"
+    default="${setting#*:}"
+    value="${!name-}"
+    [ -n "${value}" ] || value="${default}"
+    [[ "${value}" =~ ^[1-9][0-9]*$ ]] || fail "${name} must be a positive integer"
+done
+
+recording_minimum="${RECORDING_MIN_FREE_BYTES:-1073741824}"
+recording_quota="${RECORDING_QUOTA_BYTES:-53687091200}"
+if [ "${recording_minimum}" -ge "${recording_quota}" ]; then
+    fail "RECORDING_MIN_FREE_BYTES must be smaller than RECORDING_QUOTA_BYTES"
+fi
+
 if [ "${ALANA_VALIDATE_ONLY:-0}" = "1" ]; then
     echo "[config] valid"
     exit 0

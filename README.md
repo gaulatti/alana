@@ -29,6 +29,7 @@ Chromium + Xvfb + PulseAudio
         +--> independent H.264/AAC encoder --> RTMP output 1
         +--> independent H.264/AAC encoder --> RTMP output 2...
         +--> optional H.264/Opus encoder --> LiveKit program-feed participant
+        +--> optional H.264/AAC recorder --> short Matroska segments --> verified MP4
 ```
 
 Each RTMP destination has its own encoder, PID, progress journal, stall watchdog,
@@ -39,6 +40,9 @@ own encoder and publisher supervisor and never auto-subscribes to caller tracks.
 Chromium and PulseAudio are shared capture inputs with independent watchdogs.
 Container shutdown terminates every tracked browser, encoder, publisher,
 watchdog, and virtual-display process and removes PID/socket state.
+The recorder is a separate opt-in supervisor. Its failure state and restart
+budget never stop or restart Chromium, RTMP, LiveKit, or Croccante lifecycle
+control.
 
 ## Configuration
 
@@ -60,6 +64,23 @@ are never printed by Alana's supervisor.
 Chromium, FFmpeg, and LiveKit child-process diagnostics are discarded because
 those tools can repeat connection URLs on failure. Alana emits only indexed
 health and restart telemetry, never renderer URLs or publishing credentials.
+
+Optional recording:
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `RECORDING_ENABLED` | `0` | Enable the private recording control contract; disabled startup creates no recorder process |
+| `RECORDING_SEGMENT_SECONDS` | `5` | Target length of each crash-tolerant Matroska segment |
+| `RECORDING_QUOTA_BYTES` | `53687091200` | Maximum retained bytes below the recording root |
+| `RECORDING_MIN_FREE_BYTES` | `1073741824` | Free-space reserve required before and during capture |
+| `RECORDING_RETENTION_HOURS` | `168` | Age after which inactive recording directories are removed before a new Start |
+| `RECORDING_MAX_RESTARTS` | `5` | Capture-process restart budget for one operation |
+| `RECORDING_RESTART_BACKOFF_SECONDS` | `2` | Initial bounded restart delay |
+| `RECORDING_START_TIMEOUT` | `10` | Seconds for the control API to observe Active or Failed |
+| `RECORDING_FINALIZE_TIMEOUT` | `120` | Seconds allowed for verified MP4 remux/probe |
+| `RECORDING_VIDEO_BITRATE` | `6000k` | Recorder-only H.264 bitrate |
+| `RECORDING_AUDIO_BITRATE` | `128k` | Recorder-only AAC bitrate |
+| `RECORDING_X264_PRESET` | `veryfast` | Recorder-only software encoder preset |
 
 ## Broadcast lifecycle API
 
@@ -86,11 +107,62 @@ monotonically increasing `X-Command-Sequence`:
 | `PUT` | `/v1/programs/{programId}/destinations/{version}` | While stopped, validate/reload an exact destination selection through Croccante |
 | `PUT` | `/v1/programs/{programId}/fillers/{version}` | Idempotently prepare the next-session television filler in Croccante |
 | `GET` | `/v1/programs/{programId}/fillers/{version}` | Reconcile and report Croccante's readiness for one version |
+| `GET` | `/v1/programs/{programId}/recording` | Current bounded recording, disk, and finalization state |
+| `POST` | `/v1/programs/{programId}/recording/start` | Start an independent recording of the already-ready composed program |
+| `POST` | `/v1/programs/{programId}/recording/stop` | Stop capture, verify every segment, and remux a final MP4 |
 
 Commands for another program return 404. Replayed keys return their original
 result without repeating side effects; old sequences and concurrent transitions
 return 409. Token values, publish URLs, and raw idempotency keys are never stored
 in lifecycle state or emitted by the control server.
+
+Recording Start/Stop uses the same bearer credential and a bounded
+`Idempotency-Key`, but no command sequence or body. Start returns `202` after
+the independent recorder reaches Requested or Active. It fails closed when the
+shared publication pipeline is not ready, recording is disabled, or the disk
+preflight fails. Recording health never changes publication lifecycle state.
+
+## Composed-program recording
+
+When enabled and explicitly started, the recorder consumes the same X11 display
+and PulseAudio `stream_out.monitor` source as every publisher. It does not
+record an RTMP or LiveKit destination, and it never sees destination URLs or
+credentials. Its public state progresses through `requested`, `active`,
+`finalizing`, `complete`, or `failed`; an enabled runtime with no operation is
+`idle`, and the default configuration reports `disabled`.
+
+Recording data lives below `/var/lib/alana/recordings`, which is already part
+of the persistent `alana_state` volume:
+
+| Path | Meaning |
+| --- | --- |
+| `state.json` | Atomically replaced current-operation state and bounded counters |
+| `commands/<sha256>.json` | Redacted Start/Stop idempotency outcomes |
+| `operations/<operationId>/segment-NNNNNN.mkv` | Closed crash-tolerant H.264/AAC segment |
+| `operations/<operationId>/manifest.jsonl` | Fsynced append-only per-segment timing, sequence, bytes, codecs, dimensions, duration, and SHA-256 |
+| `operations/<operationId>/manifest.json` | Final bounded summary |
+| `operations/<operationId>/program.mp4` | Checksum-verified final MP4 after Stop |
+
+The supervisor records a segment only after `ffprobe` confirms both audio and
+video. A forced FFmpeg exit may discard or quarantine the one open segment;
+closed segments remain checksummed and the capture restarts at the next sequence
+within its bounded budget. A control-process or container restart resumes a
+persisted Requested/Active operation. An explicit Stop changes state to
+Finalizing, verifies every segment checksum, remuxes without transcoding, probes
+the MP4, and reports Complete only with its final checksum and media metadata.
+
+Free space and retained bytes are checked before Start and while recording.
+Crossing the reserve or quota stops only the recorder and reports the bounded
+`disk-exhausted` or `quota-exhausted` failure. Before a new Start, completed or
+failed operation directories older than `RECORDING_RETENTION_HOURS` are removed.
+Structured recorder logs contain only closed event/state/result values and
+bounded counters; operation IDs, paths, input URLs, credentials, and free-form
+FFmpeg diagnostics are excluded.
+For earlier operator cleanup, stop/finalize the current recording, preserve any
+required artifact and manifest outside the container volume, then remove only
+the selected inactive `operations/<operationId>` directory. Never remove the
+recording root or current operation while its state is Requested, Active, or
+Finalizing.
 
 Filler preparation is a separate authenticated machine operation. The `PUT`
 uses an `Idempotency-Key` equal to the bounded `commandId` in the JSON body and
@@ -298,6 +370,7 @@ RTMP legs are aggregated into configured, healthy, and progressing counts.
 | `alana_reconcile_cycles_total` | Reconciliation success/failure | `result` |
 | `alana_filler_preparations_total` | Preparation, duplicate, conflict, retry, and reconciliation outcomes | `result` |
 | `alana_destination_operations_total` | Destination reload validation outcomes | `action`, `result` |
+| `alana_recording_commands_total` | Recording Start/Stop outcomes | `action`, `result` |
 | `alana_lifecycle_state` | One-hot actual lifecycle state | `state` |
 | `alana_filler_active` | Whether the current session is bound to a prepared version | none |
 | `alana_filler_pending` | Whether a next-session version is configured | none |
@@ -311,6 +384,13 @@ RTMP legs are aggregated into configured, healthy, and progressing counts.
 | `alana_rtmp_outputs_progressing` | RTMP legs reporting frame progress | none |
 | `alana_livekit_enabled` | LiveKit configuration state | none |
 | `alana_livekit_healthy` | LiveKit runtime health | none |
+| `alana_recording_enabled` | Whether recording control is enabled | none |
+| `alana_recording_state` | One-hot bounded recording lifecycle | `state` |
+| `alana_recording_segments` / `alana_recording_bytes` / `alana_recording_duration_seconds` | Current durable recording size and duration | none |
+| `alana_recording_dropped_frames` / `alana_recording_errors_total` / `alana_recording_restarts_total` | Current operation capture counters | none |
+| `alana_recording_disk_free_bytes` / `alana_recording_disk_usage_bytes` | Current recording filesystem capacity | none |
+| `alana_recording_disk_quota_bytes` / `alana_recording_disk_minimum_free_bytes` | Configured disk gates | none |
+| `alana_recording_final_artifact_verified` / `alana_recording_final_bytes` | Verified finalization state and size | none |
 | `alana_stream_restarts_total` | Supervisor retries by leg/reason | `leg`, `reason` |
 | `alana_stream_stalls_total` | Watchdog stalls by leg | `leg` |
 | `alana_restart_backoff_seconds` | Observed restart backoff histogram | `leg` |
@@ -358,6 +438,12 @@ Before UAT, verify:
 4. Repeat container stop/start and confirm no stale PID or Unix socket remains.
 5. Run with LiveKit disabled and confirm the unattended RTMP-only program has no
    LiveKit process or health requirement.
+6. With recording enabled, kill its FFmpeg PID; confirm a later segment appears,
+   the recording restart counter advances, and every RTMP/LiveKit PID is stable.
+7. Raise the recording free-space reserve above available space; confirm
+   recording alone becomes Failed while lifecycle health remains Running.
+8. Stop a synthetic recording and use `ffprobe` to confirm synchronized audio
+   and video in `program.mp4`; verify its checksum matches the final manifest.
 
 Croccante remains a transitional RTMP destination among possible direct
 destinations. G-207 owns its production soak and the later simplification of
