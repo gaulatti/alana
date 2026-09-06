@@ -21,6 +21,7 @@ from urllib.parse import quote, unquote, urlsplit
 from urllib.request import Request, urlopen
 
 from alana_metrics import Metrics
+from recording import RecordingController
 
 
 PROGRAM_ID = os.environ.get("PROGRAM_ID", "")
@@ -35,6 +36,7 @@ CONTROL_RETRY_SECONDS = int(os.environ.get("CONTROL_RETRY_SECONDS", "5"))
 PROGRAM_PATH = f"/v1/programs/{quote(PROGRAM_ID, safe='')}/lifecycle"
 FILLER_PATH = f"/v1/programs/{quote(PROGRAM_ID, safe='')}/fillers/"
 DESTINATION_PATH = f"/v1/programs/{quote(PROGRAM_ID, safe='')}/destinations/"
+RECORDING_PATH = f"/v1/programs/{quote(PROGRAM_ID, safe='')}/recording"
 METRICS_PATH = "/metrics"
 METRICS = Metrics()
 FILLER_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
@@ -1403,12 +1405,19 @@ class LifecycleManager:
 
 
 MANAGER: LifecycleManager | None = None
+RECORDER: RecordingController | None = None
 
 
 def manager() -> LifecycleManager:
     if MANAGER is None:
         raise RuntimeError("lifecycle manager is not initialized")
     return MANAGER
+
+
+def recorder() -> RecordingController:
+    if RECORDER is None:
+        raise RuntimeError("recording controller is not initialized")
+    return RECORDER
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1421,6 +1430,8 @@ class Handler(BaseHTTPRequestHandler):
         route = (
             "metrics"
             if path == METRICS_PATH
+            else "recording"
+            if "/recording" in path
             else "destinations"
             if "/destinations/" in path
             else "filler"
@@ -1476,13 +1487,20 @@ class Handler(BaseHTTPRequestHandler):
         started = time.monotonic()
         self.response_status = 500
         path = urlsplit(self.path).path
-        route = "metrics" if path == METRICS_PATH else "destinations" if "/destinations/" in path else "filler" if "/fillers/" in path else "lifecycle" if path.startswith("/v1/programs/") else "unknown"
+        route = "metrics" if path == METRICS_PATH else "recording" if "/recording" in path else "destinations" if "/destinations/" in path else "filler" if "/fillers/" in path else "lifecycle" if path.startswith("/v1/programs/") else "unknown"
         try:
             if path == METRICS_PATH:
                 if self.authorize():
-                    self.send_metrics(METRICS.render(manager().view()))
+                    self.send_metrics(
+                        METRICS.render(
+                            {**manager().view(), "recording": recorder().status()}
+                        )
+                    )
                 return
             if not self.authorize_and_scope():
+                return
+            if path == RECORDING_PATH:
+                self.send_json(200, recorder().status())
                 return
             if path.startswith(FILLER_PATH):
                 version = unquote(path[len(FILLER_PATH) :])
@@ -1577,9 +1595,37 @@ class Handler(BaseHTTPRequestHandler):
         started = time.monotonic()
         self.response_status = 500
         path = urlsplit(self.path).path
-        route = "lifecycle" if path.startswith("/v1/programs/") else "unknown"
+        route = "recording" if "/recording" in path else "lifecycle" if path.startswith("/v1/programs/") else "unknown"
         try:
             if not self.authorize_and_scope():
+                return
+            if path in (f"{RECORDING_PATH}/start", f"{RECORDING_PATH}/stop"):
+                key = self.headers.get("Idempotency-Key", "").strip()
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                except ValueError:
+                    length = -1
+                if not key or len(key) > 200:
+                    self.send_json(
+                        400, {"error": "a bounded Idempotency-Key is required"}
+                    )
+                    return
+                if length != 0:
+                    self.send_json(400, {"error": "recording commands do not accept a body"})
+                    return
+                action = path.rsplit("/", 1)[1]
+                status, payload = recorder().command(action, key)
+                result = (
+                    "success"
+                    if status < 300
+                    else "conflict"
+                    if status == 409
+                    else "insufficient_storage"
+                    if status == 507
+                    else "failure"
+                )
+                METRICS.observe_recording_command(action, result)
+                self.send_json(status, payload)
                 return
             if path not in (f"{PROGRAM_PATH}/start", f"{PROGRAM_PATH}/stop"):
                 self.send_json(404, {"error": "not found"})
@@ -1629,9 +1675,14 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    global MANAGER
+    global MANAGER, RECORDER
     subprocess.run(["/usr/local/bin/validate-config.sh"], check=True)
     MANAGER = LifecycleManager(StateStore(), SubprocessPipeline(), CroccanteClient())
+    RECORDER = RecordingController(
+        STATE_DIR / "recordings",
+        enabled=os.environ.get("RECORDING_ENABLED", "0") == "1",
+        ready=lambda: manager().pipeline.ready(),
+    )
     server = ThreadingHTTPServer((CONTROL_BIND, CONTROL_PORT), Handler)
     signal.signal(signal.SIGTERM, interrupt_for_shutdown)
     print(
@@ -1644,6 +1695,7 @@ def main() -> None:
         pass
     finally:
         manager().closed.set()
+        recorder().close()
         manager().pipeline.stop()
         server.server_close()
 

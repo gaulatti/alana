@@ -17,7 +17,9 @@ from typing import Iterator
 
 HISTOGRAM_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120)
 HTTP_METHODS = frozenset({"GET", "POST", "PUT", "OTHER"})
-HTTP_ROUTES = frozenset({"metrics", "lifecycle", "filler", "destinations", "unknown"})
+HTTP_ROUTES = frozenset(
+    {"metrics", "lifecycle", "filler", "destinations", "recording", "unknown"}
+)
 STATUS_CLASSES = frozenset({"1xx", "2xx", "3xx", "4xx", "5xx", "unknown"})
 DEPENDENCY_OPERATIONS = frozenset(
     {"start", "stop", "prepare", "filler_status", "destination_reload", "status"}
@@ -25,6 +27,10 @@ DEPENDENCY_OPERATIONS = frozenset(
 DEPENDENCY_RESULTS = frozenset({"success", "http_error", "unavailable", "invalid_response", "unexpected_state", "token_unavailable"})
 COMMAND_ACTIONS = frozenset({"start", "stop"})
 COMMAND_RESULTS = frozenset({"success", "conflict", "dependency_failure", "not_ready", "failure"})
+RECORDING_COMMAND_ACTIONS = frozenset({"start", "stop"})
+RECORDING_COMMAND_RESULTS = frozenset(
+    {"success", "conflict", "insufficient_storage", "failure"}
+)
 RECONCILE_RESULTS = frozenset({"success", "failure"})
 PREPARATION_RESULTS = frozenset(
     {"success", "failure", "conflict", "unavailable", "duplicate", "reconciled", "not_ready"}
@@ -34,6 +40,16 @@ DESTINATION_RESULTS = frozenset(
     {"success", "failure", "conflict", "duplicate", "active"}
 )
 LIFECYCLE_STATES = ("stopped", "starting", "running", "stopping", "degraded", "failed", "transitioning", "unknown")
+RECORDING_STATES = (
+    "disabled",
+    "idle",
+    "requested",
+    "active",
+    "finalizing",
+    "complete",
+    "failed",
+    "unknown",
+)
 RUNTIME_LEGS = frozenset({"browser", "audio", "rtmp", "livekit"})
 RESTART_REASONS = frozenset({"watchdog", "exit", "stall", "encoder_unavailable"})
 RUNTIME_EVENTS = frozenset({"restart", "stall", "fallback"})
@@ -174,6 +190,13 @@ class Metrics:
     def observe_command(self, action: str, result: str) -> None:
         self._increment("alana_lifecycle_commands_total", {"action": action, "result": result}, {"action": COMMAND_ACTIONS, "result": COMMAND_RESULTS})
 
+    def observe_recording_command(self, action: str, result: str) -> None:
+        self._increment(
+            "alana_recording_commands_total",
+            {"action": action, "result": result},
+            {"action": RECORDING_COMMAND_ACTIONS, "result": RECORDING_COMMAND_RESULTS},
+        )
+
     def observe_reconcile(self, result: str) -> None:
         self._increment("alana_reconcile_cycles_total", {"result": result}, {"result": RECONCILE_RESULTS})
 
@@ -227,6 +250,7 @@ class Metrics:
             "alana_http_requests_total": "Control HTTP requests by bounded route and outcome.",
             "alana_dependency_operations_total": "Croccante control operations by bounded outcome.",
             "alana_lifecycle_commands_total": "Lifecycle commands by bounded action and result.",
+            "alana_recording_commands_total": "Recording commands by bounded action and result.",
             "alana_reconcile_cycles_total": "Lifecycle reconciliation cycles by result.",
             "alana_filler_preparations_total": "Filler preparation and reconciliation outcomes.",
             "alana_destination_operations_total": "Destination validation and reload outcomes.",
@@ -281,6 +305,72 @@ class Metrics:
             if isinstance(pending_destinations, dict)
             else 0,
         )
+
+        recording = snapshot.get("recording")
+        recording = recording if isinstance(recording, dict) else {}
+        recording_state = str(recording.get("state") or "unknown")
+        if recording_state not in RECORDING_STATES:
+            recording_state = "unknown"
+        self._gauge(
+            lines,
+            "alana_recording_enabled",
+            "Whether the opt-in composed-program recorder is enabled.",
+            int(bool(recording.get("enabled"))),
+        )
+        for state in RECORDING_STATES:
+            self._gauge(
+                lines,
+                "alana_recording_state",
+                "Current recording lifecycle state as a bounded one-hot gauge.",
+                int(state == recording_state),
+                {"state": state},
+            )
+        for name, help_text, key in (
+            ("alana_recording_segments", "Durable segments in the current recording manifest.", "segmentCount"),
+            ("alana_recording_bytes", "Durable segment bytes in the current recording.", "bytes"),
+            ("alana_recording_duration_seconds", "Verified media duration in the current recording.", "durationSeconds"),
+            ("alana_recording_dropped_frames", "Dropped frames reported by the current recorder.", "droppedFrames"),
+            ("alana_recording_final_bytes", "Bytes in the verified final artifact.", "finalBytes"),
+        ):
+            try:
+                value = max(0.0, float(recording.get(key, 0)))
+            except (TypeError, ValueError):
+                value = 0
+            self._gauge(lines, name, help_text, value)
+        for name, help_text, key in (
+            ("alana_recording_errors_total", "Bounded recorder errors in the current operation.", "errors"),
+            ("alana_recording_restarts_total", "Recorder capture restarts in the current operation.", "restarts"),
+        ):
+            try:
+                value = max(0, int(recording.get(key, 0)))
+            except (TypeError, ValueError):
+                value = 0
+            lines.extend(
+                (
+                    f"# HELP {name} {help_text}",
+                    f"# TYPE {name} counter",
+                    f"{name} {value}",
+                )
+            )
+        self._gauge(
+            lines,
+            "alana_recording_final_artifact_verified",
+            "Whether finalization produced a verified playable MP4.",
+            int(recording.get("finalizationState") == "verified"),
+        )
+        disk = recording.get("disk")
+        disk = disk if isinstance(disk, dict) else {}
+        for name, help_text, key in (
+            ("alana_recording_disk_free_bytes", "Free bytes on the recording filesystem.", "freeBytes"),
+            ("alana_recording_disk_usage_bytes", "Bytes retained under the recording root.", "usageBytes"),
+            ("alana_recording_disk_quota_bytes", "Configured retained-recording byte quota.", "quotaBytes"),
+            ("alana_recording_disk_minimum_free_bytes", "Configured minimum free-space reserve.", "minFreeBytes"),
+        ):
+            try:
+                value = max(0, int(disk.get(key, 0)))
+            except (TypeError, ValueError):
+                value = 0
+            self._gauge(lines, name, help_text, value)
 
         with _runtime_lock(self.runtime_path):
             runtime = _read_runtime_state(self.runtime_path)
