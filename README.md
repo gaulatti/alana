@@ -450,3 +450,40 @@ Croccante remains a transitional RTMP destination among possible direct
 destinations. G-207 owns its production soak and the later simplification of
 Alana to one Croccante RTMP output. OBS may remain during staged rollout but is
 not part of Alana's runtime architecture.
+
+## Pull request verification
+
+Local agent review uses the shared `clouseau` skill with the developer's
+authenticated coding harness and the `.clouseau-local.json` recipe; it needs no
+CI provider keys. `AGENTS.md` owns the rule: run it against the final committed
+change before opening a PR, repair findings, and publish the passing signed
+receipt in the initial ready PR body. Never push directly to `main`.
+
+Every PR runs:
+
+- the shell and runtime contract (`shellcheck`, `bash test/runtime-contract.sh`),
+- the Python unit tests under coverage.py with branch measurement
+  (`python3 -m coverage run --branch --source=. -m unittest discover -s test -p 'test_*.py'`,
+  then `python3 -m coverage json --omit='test/*' -o coverage/coverage.json`),
+- the native amd64 (Compose) and arm64 image builds, and the private
+  authenticated `/metrics` scrape validated with `promtool`,
+- the workflow-contract tests in `.github/tests`.
+
+The Clouseau gate requires exactly 100% line and branch coverage over every
+Python application source (`coveragepy` format, source directory `.`). New
+behaviour needs a test in `test/`, never a coverage pragma. Until the suite
+reaches that bar the coverage step fails, so a PR stays in human review and is
+merged by the owner rather than automatically.
+
+A PR carrying an authenticated local review stamp is verified by the pinned
+Clouseau engine without AI credentials; unstamped PRs use the CI reviewer.
+Passing reviews receive a bot approval and native auto-merge. Unresolved
+product-direction questions go to the owner, and changes to review controls need
+the owner's `/approve-intent <head SHA>` comment. See [the purpose
+contract](.github/clouseau.md). The CI engine is resolved from protected
+Clouseau `main` at the start of each run (see
+[automatic Clouseau CI upgrades](https://github.com/gaulatti/clouseau/blob/main/docs/automatic-ci-upgrades.md)).
+
+CI needs these repository secrets: `DEEPSEEK_API_KEY` and `TYPESAFE_API_KEY` for
+the CI reviewer, and `DEPLOYMENT_TOKEN` (a token with contents write access
+from an identity other than `github-actions[bot]`) for automatic repairs.
