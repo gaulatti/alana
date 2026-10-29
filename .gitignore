@@ -13,3 +13,5 @@ __pycache__/
 
 # Benchmark tools (dev-only)
 bench/
+coverage/
+.coverage

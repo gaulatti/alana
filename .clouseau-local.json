@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "base_branch": "main",
+  "readme": "README.md",
+  "repository_policy": "AGENTS.md",
+  "verification": [
+    [
+      "bash",
+      "test/runtime-contract.sh"
+    ],
+    [
+      "python3",
+      "-m",
+      "coverage",
+      "run",
+      "--branch",
+      "--source=.",
+      "-m",
+      "unittest",
+      "discover",
+      "-s",
+      "test",
+      "-p",
+      "test_*.py"
+    ],
+    [
+      "python3",
+      "-m",
+      "coverage",
+      "json",
+      "--omit=test/*",
+      "-o",
+      "coverage/coverage.json"
+    ]
+  ],
+  "coverage": {
+    "format": "coveragepy",
+    "report": "coverage/coverage.json",
+    "source_directory": "."
+  }
+}
