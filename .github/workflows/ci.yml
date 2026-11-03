@@ -41,7 +41,7 @@ jobs:
       digest: ${{ steps.engine.outputs.digest }}
     steps:
       - id: engine
-        uses: gaulatti/clouseau/scripts/resolve@fd655851419980f833ff13a94b0d6ff41a901cb2
+        uses: gaulatti/clouseau/scripts/resolve@main
 
   unit:
     if: &verify-code >-
@@ -59,6 +59,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+          fetch-depth: 0
       - name: Check out this run frozen Clouseau engine
         uses: actions/checkout@v4
         with:
@@ -85,6 +86,28 @@ jobs:
         run: |
           python3 -m coverage run --branch --source=. -m unittest discover -s test -p 'test_*.py'
           python3 -m coverage json --omit='test/*' -o coverage/coverage.json
+      - name: Measure base revision coverage for changed-line mode
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          # A manual verification run has no base revision. The coverage step then receives no base ref or baseline,
+          # so it runs the stricter exact gate; there is nothing to measure here.
+          if test -z "$BASE_SHA"; then
+            echo 'No base revision (manual run): skipping the base coverage baseline; the exact coverage gate applies.'
+            exit 0
+          fi
+          # The coverage mode comes only from the accepted base configuration, never from the contributor's file.
+          if git cat-file -e "$BASE_SHA:.github/clouseau.json" 2>/dev/null; then
+            git show "$BASE_SHA:.github/clouseau.json" > "$RUNNER_TEMP/clouseau-config.json"
+          else
+            cp .github/clouseau.json "$RUNNER_TEMP/clouseau-config.json"
+          fi
+          if test "$(node .clouseau-ci/bin/coverage-gate.cjs mode "$RUNNER_TEMP/clouseau-config.json")" != changed_lines; then exit 0; fi
+          git worktree add --detach "$RUNNER_TEMP/clouseau-base" "$BASE_SHA"
+          cd "$RUNNER_TEMP/clouseau-base"
+          python3 -m coverage run --branch --source=. -m unittest discover -s test -p 'test_*.py'
+          python3 -m coverage json --omit='test/*' -o coverage/coverage.json
+          node "$GITHUB_WORKSPACE/.clouseau-ci/bin/coverage-gate.cjs" totals coverage/coverage.json . coveragepy > "$GITHUB_WORKSPACE/coverage/baseline.json"
       - name: Set up Python for frozen shared tests
         uses: actions/setup-python@v5
         with:
@@ -109,6 +132,7 @@ jobs:
           name: application-coverage-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             coverage/coverage.json
+            coverage/baseline.json
           if-no-files-found: error
 
   verify:
@@ -135,6 +159,7 @@ jobs:
         if: *verify-code
         with:
           persist-credentials: false
+          fetch-depth: 0
       - name: Check out this run frozen Clouseau engine
         if: *verify-code
         uses: actions/checkout@v4
@@ -143,6 +168,17 @@ jobs:
           ref: ${{ needs.resolve-clouseau.outputs.sha || '0000000000000000000000000000000000000000' }}
           path: .clouseau-ci
           persist-credentials: false
+      - name: Select accepted coverage configuration
+        if: *verify-code
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          # The coverage mode comes only from the accepted base configuration, never from the contributor's file.
+          if test -n "$BASE_SHA" && git cat-file -e "$BASE_SHA:.github/clouseau.json" 2>/dev/null; then
+            git show "$BASE_SHA:.github/clouseau.json" > "$RUNNER_TEMP/clouseau-config.json"
+          else
+            cp .github/clouseau.json "$RUNNER_TEMP/clouseau-config.json"
+          fi
       - name: Load this run's native coverage report
         if: *verify-code
         uses: actions/download-artifact@v4
@@ -154,9 +190,13 @@ jobs:
         uses: ./.clouseau-ci
         with:
           operation: coverage
+          config: ${{ runner.temp }}/clouseau-config.json
           coverage-format: coveragepy
           coverage-report: coverage/coverage.json
           source-directory: .
+          # Empty on a manual run: with no base ref the engine runs the stricter exact gate (same as the other managed repositories).
+          coverage-base-ref: ${{ github.event.pull_request.base.sha || github.event.before }}
+          coverage-baseline: ${{ (github.event.pull_request.base.sha || github.event.before) && 'coverage/baseline.json' || '' }}
       - name: Require workflow tests execution
         if: *verify-code
         env:
