@@ -90,14 +90,19 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
+          # A manual verification run has no base revision. The coverage step then receives no base ref or baseline,
+          # so it runs the stricter exact gate; there is nothing to measure here.
+          if test -z "$BASE_SHA"; then
+            echo 'No base revision (manual run): skipping the base coverage baseline; the exact coverage gate applies.'
+            exit 0
+          fi
           # The coverage mode comes only from the accepted base configuration, never from the contributor's file.
-          if test -n "$BASE_SHA" && git cat-file -e "$BASE_SHA:.github/clouseau.json" 2>/dev/null; then
+          if git cat-file -e "$BASE_SHA:.github/clouseau.json" 2>/dev/null; then
             git show "$BASE_SHA:.github/clouseau.json" > "$RUNNER_TEMP/clouseau-config.json"
           else
             cp .github/clouseau.json "$RUNNER_TEMP/clouseau-config.json"
           fi
           if test "$(node .clouseau-ci/bin/coverage-gate.cjs mode "$RUNNER_TEMP/clouseau-config.json")" != changed_lines; then exit 0; fi
-          test -n "$BASE_SHA"
           git worktree add --detach "$RUNNER_TEMP/clouseau-base" "$BASE_SHA"
           cd "$RUNNER_TEMP/clouseau-base"
           python3 -m coverage run --branch --source=. -m unittest discover -s test -p 'test_*.py'
@@ -189,8 +194,9 @@ jobs:
           coverage-format: coveragepy
           coverage-report: coverage/coverage.json
           source-directory: .
+          # Empty on a manual run: with no base ref the engine runs the stricter exact gate (same as the other managed repositories).
           coverage-base-ref: ${{ github.event.pull_request.base.sha || github.event.before }}
-          coverage-baseline: coverage/baseline.json
+          coverage-baseline: ${{ (github.event.pull_request.base.sha || github.event.before) && 'coverage/baseline.json' || '' }}
       - name: Require workflow tests execution
         if: *verify-code
         env:
