@@ -110,6 +110,10 @@ monotonically increasing `X-Command-Sequence`:
 | `GET` | `/v1/programs/{programId}/recording` | Current bounded recording, disk, and finalization state |
 | `POST` | `/v1/programs/{programId}/recording/start` | Start an independent recording of the already-ready composed program |
 | `POST` | `/v1/programs/{programId}/recording/stop` | Stop capture, verify every segment, and remux a final MP4 |
+| `GET` | `/v1/programs/{programId}/recording/file` | Stream the verified final MP4 (single `Range` supported); 404 until finalization is verified |
+| `GET` | `/v1/programs/{programId}/tape` | Active state, pipeline health, and the recording status |
+| `POST` | `/v1/programs/{programId}/tape/start` | Run the program output privately and record it in real time |
+| `POST` | `/v1/programs/{programId}/tape/stop` | Stop capture, finalize the MP4, and tear the private output down |
 
 Commands for another program return 404. Replayed keys return their original
 result without repeating side effects; old sequences and concurrent transitions
@@ -121,6 +125,25 @@ Recording Start/Stop uses the same bearer credential and a bounded
 the independent recorder reaches Requested or Active. It fails closed when the
 shared publication pipeline is not ready, recording is disabled, or the disk
 preflight fails. Recording health never changes publication lifecycle state.
+
+## Private taping
+
+With the recorder enabled (`RECORDING_ENABLED=1`), `POST .../tape/start` launches the same browser and audio
+pipeline with `TAPE_MODE=1`: no RTMP publishers, no LiveKit, no filler, and no
+Croccante call, so nothing reaches a public destination. It then starts the
+composed-program recorder. `POST .../tape/stop` stops capture, finalizes and
+verifies `program.mp4`, then stops the private pipeline. The file is read from
+`GET .../recording/file`.
+
+Tape and live broadcast are mutually exclusive. Tape Start returns 409
+`program-live` while a broadcast is requested, transitioning, or its pipeline is
+running, and a lifecycle Start returns 409 `tape-active` while a tape is
+running. Both use the same bearer credential and a bounded `Idempotency-Key`
+with no body. If the recorder ends on its own (for example disk exhaustion), the
+next status read tears the private pipeline down. A container restart during a
+tape leaves the recorder awaiting readiness; Stop finalizes the segments already
+captured. Completed recordings are removed by the retention window before a new
+Start, so download a tape before starting another after `RECORDING_RETENTION_HOURS`.
 
 ## Composed-program recording
 

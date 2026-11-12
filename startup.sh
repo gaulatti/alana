@@ -18,6 +18,8 @@ VIDEO_ENCODER="${VIDEO_ENCODER:-libx264}"
 VAAPI_DEVICE="${VAAPI_DEVICE:-}"
 VAAPI_DRIVER="${VAAPI_DRIVER:-}"
 RTMP_OUTPUTS="${RTMP_OUTPUTS:-}"
+# TAPE_MODE=1 runs the program output privately: no RTMP or LiveKit publishers.
+TAPE_MODE="${TAPE_MODE:-0}"
 YOUTUBE_RTMP_URL="rtmp://a.rtmp.youtube.com/live2"
 LIVEKIT_ENABLED="${LIVEKIT_ENABLED:-0}"
 LIVEKIT_URL="${LIVEKIT_URL:-}"
@@ -216,7 +218,12 @@ livekit_supervisor() (
 )
 
 case "${GPU_TYPE:-}" in NVIDIA) rtmp_encoder=h264_nvenc ;; INTEL) rtmp_encoder=h264_vaapi ;; *) rtmp_encoder="${VIDEO_ENCODER}" ;; esac
-mapfile -t outputs < <(get_rtmp_outputs)
+if [ "${TAPE_MODE}" = 1 ]; then
+    outputs=()
+    LIVEKIT_ENABLED=0
+else
+    mapfile -t outputs < <(get_rtmp_outputs)
+fi
 for index in "${!outputs[@]}"; do rtmp_supervisor "$((index + 1))" "${outputs[index]}" "${rtmp_encoder}" & background_pids+=($!); done
 [ "${LIVEKIT_ENABLED}" != 1 ] || { livekit_supervisor & background_pids+=($!); }
 
@@ -226,7 +233,7 @@ for index in "${!outputs[@]}"; do rtmp_supervisor "$((index + 1))" "${outputs[in
 done ) & background_pids+=($!)
 ( while true; do sleep 15; pactl info >/dev/null 2>&1 || { metric_event restart audio watchdog 0; pulseaudio --start --exit-idle-time=-1 2>/dev/null || true; sleep 2; pactl load-module module-null-sink sink_name=stream_out >/dev/null 2>&1 || true; pactl set-default-sink stream_out 2>/dev/null || true; }; done ) & background_pids+=($!)
 
-echo "[startup] program=${PROGRAM_ID} rtmp_outputs=${#outputs[@]} livekit_enabled=${LIVEKIT_ENABLED}" >&2
+echo "[startup] program=${PROGRAM_ID} tape_mode=${TAPE_MODE} rtmp_outputs=${#outputs[@]} livekit_enabled=${LIVEKIT_ENABLED}" >&2
 while true; do
     sleep 60
 done
