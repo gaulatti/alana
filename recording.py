@@ -1060,6 +1060,17 @@ class RecordingController:
     def command(self, action: str, key: str) -> tuple[int, dict[str, object]]:
         return self.start(key) if action == "start" else self.stop(key)
 
+    def final_artifact(self) -> tuple[Path, dict[str, object]] | None:
+        """Return the verified final MP4 only after finalization has completed."""
+        state = self.store.load(enabled=self.enabled)
+        if state.get("state") != "complete" or state.get("finalizationState") != "verified":
+            return None
+        operation_id = str(state.get("operationId") or "")
+        if not OPERATION_ID.fullmatch(operation_id):
+            return None
+        path = self.store.operation_dir(operation_id) / "program.mp4"
+        return (path, state) if path.is_file() else None
+
     def _monitor(self) -> None:
         while not self.closed.wait(1):
             with self.lock:

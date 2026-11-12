@@ -37,6 +37,8 @@ PROGRAM_PATH = f"/v1/programs/{quote(PROGRAM_ID, safe='')}/lifecycle"
 FILLER_PATH = f"/v1/programs/{quote(PROGRAM_ID, safe='')}/fillers/"
 DESTINATION_PATH = f"/v1/programs/{quote(PROGRAM_ID, safe='')}/destinations/"
 RECORDING_PATH = f"/v1/programs/{quote(PROGRAM_ID, safe='')}/recording"
+RECORDING_FILE_PATH = f"{RECORDING_PATH}/file"
+TAPE_PATH = f"/v1/programs/{quote(PROGRAM_ID, safe='')}/tape"
 METRICS_PATH = "/metrics"
 METRICS = Metrics()
 FILLER_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
@@ -231,16 +233,19 @@ class SubprocessPipeline:
         outputs = os.environ.get("RTMP_OUTPUTS", "")
         self.expected_rtmp = len([value for value in re.split(r"[,\s]+", outputs) if value]) or 1
         self.livekit_required = os.environ.get("LIVEKIT_ENABLED", "0") == "1"
+        self.tape = False
 
     def running(self) -> bool:
         return self.process is not None and self.process.poll() is None
 
-    def start(self) -> None:
+    def start(self, tape: bool = False) -> None:
         if self.running():
             return
+        self.tape = tape
         self.process = subprocess.Popen(
             ["/usr/local/bin/startup.sh"],
             start_new_session=True,
+            env={**os.environ, "TAPE_MODE": "1"} if tape else None,
         )
 
     @staticmethod
@@ -258,6 +263,9 @@ class SubprocessPipeline:
     def ready(self) -> bool:
         if not self.running() or not pid_alive(Path("/tmp/channel-browser.pid")):
             return False
+        if self.tape:
+            # A private tape has no publishers: the composed display is the output.
+            return True
         for index in range(1, self.expected_rtmp + 1):
             if not pid_alive(Path(f"/tmp/rtmp-{index}.pid")) or not self._progressing(index):
                 return False
@@ -290,6 +298,7 @@ class SubprocessPipeline:
         }
 
     def stop(self) -> None:
+        self.tape = False
         if not self.running() or self.process is None:
             self.process = None
             return
@@ -731,6 +740,7 @@ class LifecycleManager:
         self.preparation_lock = threading.Lock()
         self.state = store.load()
         self.transient_destination_selections: dict[str, dict[str, object]] = {}
+        self.tape_active: Callable[[], bool] = lambda: False
         self.closed = threading.Event()
         if start_monitor:
             threading.Thread(target=self._monitor, daemon=True).start()
@@ -1105,6 +1115,10 @@ class LifecycleManager:
         destination_selection: dict[str, object],
         destination: dict[str, object],
     ) -> tuple[int, dict[str, object]]:
+        if self.tape_active():
+            return self._finish_command(
+                key, "start", sequence, "tape-active", 409, destination
+            )
         if (
             self.state.get("requestedState") == "running"
             and self.state.get("actualState") == "running"
@@ -1404,14 +1418,181 @@ class LifecycleManager:
                 print(f"[lifecycle] reconcile failed type={type(exc).__name__}", flush=True)
 
 
+class TapeController:
+    """Private, real-time taping of the composed program.
+
+    A tape runs the same browser/audio output as a broadcast with no RTMP,
+    LiveKit, filler or Croccante involvement, and records it with the existing
+    crash-tolerant recorder. It never runs while the program is live.
+    """
+
+    def __init__(
+        self,
+        get_manager: Callable[[], LifecycleManager],
+        get_recorder: Callable[[], RecordingController],
+        root: Path,
+        sleep: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
+        ready_timeout: int = PIPELINE_READY_TIMEOUT,
+    ):
+        self.get_manager = get_manager
+        self.get_recorder = get_recorder
+        self.root = root
+        self.sleep = sleep
+        self.monotonic = monotonic
+        self.ready_timeout = ready_timeout
+        self.lock = threading.RLock()
+        self.state_path = root / "tape.json"
+        self.command_dir = root / "tape-commands"
+        self.command_dir.mkdir(parents=True, exist_ok=True)
+        persisted = {}
+        try:
+            persisted = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            pass
+        self.active = persisted.get("active") is True
+        self.starting = False
+
+    def is_active(self) -> bool:
+        return self.active
+
+    def _save(self) -> None:
+        atomic_json(self.state_path, {"active": self.active})
+
+    def _command_path(self, key: str) -> Path:
+        return self.command_dir / f"{hashlib.sha256(key.encode()).hexdigest()}.json"
+
+    def _derived_key(self, action: str, key: str) -> str:
+        return f"tape-{action}-{hashlib.sha256(key.encode()).hexdigest()[:32]}"
+
+    def view(self) -> dict[str, object]:
+        manager = self.get_manager()
+        recording = self.get_recorder().status()
+        if (
+            self.active
+            and not self.starting
+            and recording.get("state") in ("complete", "failed", "idle")
+        ):
+            # The recorder ended on its own (for example disk exhausted): never
+            # leave a private pipeline running with nothing capturing it.
+            manager.pipeline.stop()
+            self.active = False
+            self._save()
+        return {
+            "tape": {
+                "enabled": bool(recording.get("enabled")),
+                "active": self.active,
+                "pipelineHealthy": bool(self.active and manager.pipeline.ready()),
+            },
+            "recording": recording,
+        }
+
+    def _record(self, key: str, action: str, status: int, result: str):
+        record = {"action": action, "status": status, "result": result}
+        atomic_json(self._command_path(key), record)
+        return status, {**self.view(), "commandResult": record}
+
+    def _prior(self, key: str, action: str):
+        try:
+            prior = json.loads(self._command_path(key).read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return None
+        if prior.get("action") != action:
+            return 409, {**self.view(), "error": "idempotency key was already used"}
+        return int(prior["status"]), {
+            **self.view(),
+            "commandResult": {**prior, "duplicate": True},
+        }
+
+    def command(self, action: str, key: str) -> tuple[int, dict[str, object]]:
+        with self.lock:
+            prior = self._prior(key, action)
+            if prior:
+                return prior
+            return self._start(key) if action == "start" else self._stop(key)
+
+    def _start(self, key: str) -> tuple[int, dict[str, object]]:
+        self.starting = True
+        try:
+            return self._start_locked(key)
+        finally:
+            self.starting = False
+
+    def _start_locked(self, key: str) -> tuple[int, dict[str, object]]:
+        manager = self.get_manager()
+        if not self.get_recorder().status().get("enabled"):
+            return self._record(key, "start", 409, "disabled")
+        with manager.lock:
+            if self.active:
+                return self._record(key, "start", 409, "already-active")
+            if (
+                manager.state.get("requestedState") == "running"
+                or manager.state.get("transition") in ("starting", "stopping")
+                or manager.pipeline.running()
+            ):
+                return self._record(key, "start", 409, "program-live")
+            self.active = True
+            self._save()
+            manager.pipeline.start(tape=True)
+            deadline = self.monotonic() + self.ready_timeout
+            while self.monotonic() < deadline and not manager.pipeline.ready():
+                self.sleep(0.5)
+            ready = manager.pipeline.ready()
+        if not ready:
+            return self._abort_start(key, 503, "pipeline-not-ready")
+        status, payload = self.get_recorder().command(
+            "start", self._derived_key("start", key)
+        )
+        if status >= 300:
+            result = (payload.get("commandResult") or {}).get("result") or "capture-failed"
+            return self._abort_start(key, status, str(result))
+        return self._record(key, "start", 202, "accepted")
+
+    def _abort_start(self, key: str, status: int, result: str):
+        manager = self.get_manager()
+        with manager.lock:
+            manager.pipeline.stop()
+            self.active = False
+            self._save()
+        return self._record(key, "start", status, result)
+
+    def _stop(self, key: str) -> tuple[int, dict[str, object]]:
+        recording = self.get_recorder().status()
+        if not self.active and recording.get("state") not in (
+            "requested",
+            "active",
+            "finalizing",
+        ):
+            return self._record(key, "stop", 409, "not-active")
+        status, payload = self.get_recorder().command(
+            "stop", self._derived_key("stop", key)
+        )
+        manager = self.get_manager()
+        with manager.lock:
+            manager.pipeline.stop()
+            self.active = False
+            self._save()
+        result = (payload.get("commandResult") or {}).get("result") or (
+            "complete" if status < 300 else "finalize-failed"
+        )
+        return self._record(key, "stop", status, str(result))
+
+
 MANAGER: LifecycleManager | None = None
 RECORDER: RecordingController | None = None
+TAPE: TapeController | None = None
 
 
 def manager() -> LifecycleManager:
     if MANAGER is None:
         raise RuntimeError("lifecycle manager is not initialized")
     return MANAGER
+
+
+def tape() -> TapeController:
+    if TAPE is None:
+        raise RuntimeError("tape controller is not initialized")
+    return TAPE
 
 
 def recorder() -> RecordingController:
@@ -1452,6 +1633,58 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_recording_file(self) -> None:
+        artifact = recorder().final_artifact()
+        if artifact is None:
+            self.send_json(404, {"error": "no verified recording is available"})
+            return
+        path, state = artifact
+        size = path.stat().st_size
+        start, end = 0, size - 1
+        status = 200
+        range_header = self.headers.get("Range", "").strip()
+        if range_header:
+            match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header)
+            if not match or (not match.group(1) and not match.group(2)):
+                self.send_json(416, {"error": "unsatisfiable range"})
+                return
+            if match.group(1):
+                start = int(match.group(1))
+                end = int(match.group(2)) if match.group(2) else size - 1
+            else:
+                start = max(0, size - int(match.group(2)))
+            end = min(end, size - 1)
+            if start > end or start >= size:
+                self.send_response(416)
+                self.response_status = 416
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            status = 206
+        stamp = re.sub(r"[^0-9A-Za-z]", "", str(state.get("finalizedAt") or ""))[:15]
+        self.send_response(status)
+        self.response_status = status
+        self.send_header("Content-Type", "video/mp4")
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(end - start + 1))
+        if status == 206:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.send_header(
+            "Content-Disposition", f'attachment; filename="program-{stamp or "tape"}.mp4"'
+        )
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        remaining = end - start + 1
+        with path.open("rb") as handle:
+            handle.seek(start)
+            while remaining > 0:
+                chunk = handle.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                remaining -= len(chunk)
+
     def send_metrics(self, payload: str) -> None:
         body = payload.encode()
         self.send_response(200)
@@ -1487,7 +1720,7 @@ class Handler(BaseHTTPRequestHandler):
         started = time.monotonic()
         self.response_status = 500
         path = urlsplit(self.path).path
-        route = "metrics" if path == METRICS_PATH else "recording" if "/recording" in path else "destinations" if "/destinations/" in path else "filler" if "/fillers/" in path else "lifecycle" if path.startswith("/v1/programs/") else "unknown"
+        route = "metrics" if path == METRICS_PATH else "tape" if path.startswith(TAPE_PATH) else "recording" if "/recording" in path else "destinations" if "/destinations/" in path else "filler" if "/fillers/" in path else "lifecycle" if path.startswith("/v1/programs/") else "unknown"
         try:
             if path == METRICS_PATH:
                 if self.authorize():
@@ -1501,6 +1734,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == RECORDING_PATH:
                 self.send_json(200, recorder().status())
+                return
+            if path == TAPE_PATH:
+                self.send_json(200, tape().view())
+                return
+            if path == RECORDING_FILE_PATH:
+                self.send_recording_file()
                 return
             if path.startswith(FILLER_PATH):
                 version = unquote(path[len(FILLER_PATH) :])
@@ -1595,9 +1834,26 @@ class Handler(BaseHTTPRequestHandler):
         started = time.monotonic()
         self.response_status = 500
         path = urlsplit(self.path).path
-        route = "recording" if "/recording" in path else "lifecycle" if path.startswith("/v1/programs/") else "unknown"
+        route = "tape" if path.startswith(TAPE_PATH) else "recording" if "/recording" in path else "lifecycle" if path.startswith("/v1/programs/") else "unknown"
         try:
             if not self.authorize_and_scope():
+                return
+            if path in (f"{TAPE_PATH}/start", f"{TAPE_PATH}/stop"):
+                key = self.headers.get("Idempotency-Key", "").strip()
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                except ValueError:
+                    length = -1
+                if not key or len(key) > 200:
+                    self.send_json(
+                        400, {"error": "a bounded Idempotency-Key is required"}
+                    )
+                    return
+                if length != 0:
+                    self.send_json(400, {"error": "tape commands do not accept a body"})
+                    return
+                status, payload = tape().command(path.rsplit("/", 1)[1], key)
+                self.send_json(status, payload)
                 return
             if path in (f"{RECORDING_PATH}/start", f"{RECORDING_PATH}/stop"):
                 key = self.headers.get("Idempotency-Key", "").strip()
@@ -1675,7 +1931,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    global MANAGER, RECORDER
+    global MANAGER, RECORDER, TAPE
     subprocess.run(["/usr/local/bin/validate-config.sh"], check=True)
     MANAGER = LifecycleManager(StateStore(), SubprocessPipeline(), CroccanteClient())
     RECORDER = RecordingController(
@@ -1683,6 +1939,12 @@ def main() -> None:
         enabled=os.environ.get("RECORDING_ENABLED", "0") == "1",
         ready=lambda: manager().pipeline.ready(),
     )
+    TAPE = TapeController(
+        manager,
+        recorder,
+        STATE_DIR / "recordings",
+    )
+    manager().tape_active = TAPE.is_active
     server = ThreadingHTTPServer((CONTROL_BIND, CONTROL_PORT), Handler)
     signal.signal(signal.SIGTERM, interrupt_for_shutdown)
     print(

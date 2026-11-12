@@ -18,7 +18,7 @@ from typing import Iterator
 HISTOGRAM_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120)
 HTTP_METHODS = frozenset({"GET", "POST", "PUT", "OTHER"})
 HTTP_ROUTES = frozenset(
-    {"metrics", "lifecycle", "filler", "destinations", "recording", "unknown"}
+    {"metrics", "lifecycle", "filler", "destinations", "recording", "tape", "unknown"}
 )
 STATUS_CLASSES = frozenset({"1xx", "2xx", "3xx", "4xx", "5xx", "unknown"})
 DEPENDENCY_OPERATIONS = frozenset(
