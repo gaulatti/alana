@@ -39,10 +39,10 @@ class FakePipeline:
     def running(self):
         return self.is_running
 
-    def start(self):
+    def start(self, tape=False):
         if self.is_running:
             return
-        self.events.append("pipeline:start")
+        self.events.append("pipeline:start-tape" if tape else "pipeline:start")
         self.is_running = True
 
     def ready(self):
@@ -63,6 +63,12 @@ class FakeRecording:
 
     def status(self):
         return dict(self.state)
+
+    def final_artifact(self):
+        path = getattr(self, "artifact_path", None)
+        if path is None or self.state.get("state") != "complete":
+            return None
+        return path, {"finalizedAt": "2026-11-12T10:00:00Z"}
 
     def command(self, action, key):
         prior = self.commands.get(key)
@@ -761,6 +767,183 @@ class LifecycleTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join()
+
+
+class TapeTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.events = []
+        control.METRICS = control.Metrics(self.root / "runtime-metrics.json")
+        self.pipeline = FakePipeline(self.events)
+        self.croccante = FakeCroccante(self.events)
+        self.manager = control.LifecycleManager(
+            control.StateStore(self.root),
+            self.pipeline,
+            self.croccante,
+            sleep=lambda _: None,
+            ready_timeout=1,
+            start_monitor=False,
+        )
+        self.manager.state["pendingFiller"] = {
+            "version": "filler-v1",
+            "status": "ready",
+            "ready": True,
+            "configurationDigest": "fixture",
+        }
+        self.manager._save()
+        self.recording = FakeRecording()
+        self.tape = self.make_tape()
+
+    def make_tape(self):
+        tape = control.TapeController(
+            lambda: self.manager,
+            lambda: self.recording,
+            self.root,
+            sleep=lambda _: None,
+            ready_timeout=1,
+        )
+        self.manager.tape_active = tape.is_active
+        return tape
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_disabled_recorder_launches_nothing(self):
+        self.recording.state = {**self.recording.state, "enabled": False, "state": "disabled"}
+        status, payload = self.tape.command("start", "tape-1")
+        self.assertEqual(status, 409)
+        self.assertEqual(payload["commandResult"]["result"], "disabled")
+        self.assertEqual(self.events, [])
+        self.assertFalse(payload["tape"]["active"])
+
+    def test_start_is_private_and_records(self):
+        status, payload = self.tape.command("start", "tape-1")
+        self.assertEqual(status, 202)
+        self.assertEqual(self.events, ["pipeline:start-tape"])
+        self.assertTrue(payload["tape"]["active"])
+        self.assertEqual(payload["recording"]["state"], "active")
+        self.assertNotIn("croccante", json.dumps(self.events))
+
+    def test_start_is_refused_while_the_program_is_live(self):
+        self.manager.state["requestedState"] = "running"
+        status, payload = self.tape.command("start", "tape-1")
+        self.assertEqual(status, 409)
+        self.assertEqual(payload["commandResult"]["result"], "program-live")
+        self.assertEqual(self.events, [])
+        self.assertFalse(self.tape.active)
+
+    def test_live_start_is_refused_while_taping(self):
+        self.tape.command("start", "tape-1")
+        self.events.clear()
+        status, payload = self.manager.command(
+            "start", "live-1", 1, json.loads(json.dumps(TEST_DESTINATION_SELECTION))
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(payload["commandResult"]["result"], "tape-active")
+        self.assertEqual(self.events, [])
+
+    def test_stop_finalizes_then_tears_the_pipeline_down(self):
+        self.tape.command("start", "tape-1")
+        status, payload = self.tape.command("stop", "tape-stop-1")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["recording"]["state"], "complete")
+        self.assertFalse(payload["tape"]["active"])
+        self.assertEqual(self.events, ["pipeline:start-tape", "pipeline:stop"])
+
+    def test_commands_are_idempotent_and_keys_not_reusable_across_actions(self):
+        first = self.tape.command("start", "tape-1")
+        self.events.clear()
+        replay = self.tape.command("start", "tape-1")
+        self.assertEqual(replay[0], first[0])
+        self.assertTrue(replay[1]["commandResult"]["duplicate"])
+        self.assertEqual(self.events, [])
+        self.assertEqual(self.tape.command("stop", "tape-1")[0], 409)
+
+    def test_stop_without_a_tape_is_rejected(self):
+        status, payload = self.tape.command("stop", "tape-stop-1")
+        self.assertEqual(status, 409)
+        self.assertEqual(payload["commandResult"]["result"], "not-active")
+
+    def test_unready_pipeline_is_torn_down_and_reported(self):
+        self.pipeline.is_ready = False
+        status, payload = self.tape.command("start", "tape-1")
+        self.assertEqual(status, 503)
+        self.assertEqual(payload["commandResult"]["result"], "pipeline-not-ready")
+        self.assertFalse(payload["tape"]["active"])
+        self.assertEqual(self.events, ["pipeline:start-tape", "pipeline:stop"])
+
+    def test_recorder_failure_never_leaves_a_private_pipeline_running(self):
+        self.tape.command("start", "tape-1")
+        self.recording.state = {**self.recording.state, "state": "failed", "error": "disk-exhausted"}
+        view = self.tape.view()
+        self.assertFalse(view["tape"]["active"])
+        self.assertEqual(self.events[-1], "pipeline:stop")
+
+    def test_active_flag_survives_a_restart(self):
+        self.tape.command("start", "tape-1")
+        self.assertTrue(self.make_tape().active)
+
+    def test_http_routes_and_range_download(self):
+        token_file = self.root / "control-token"
+        token_file.write_text("api-secret\n")
+        control.CONTROL_TOKEN_FILE = token_file
+        control.MANAGER = self.manager
+        control.RECORDER = self.recording
+        control.TAPE = self.tape
+        server = control.ThreadingHTTPServer(("127.0.0.1", 0), control.Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        origin = f"http://127.0.0.1:{server.server_port}"
+        auth = {"Authorization": "Bearer api-secret"}
+        try:
+            with urlopen(Request(f"{origin}{control.TAPE_PATH}", headers=auth)) as response:
+                self.assertFalse(json.loads(response.read())["tape"]["active"])
+            with self.assertRaises(HTTPError) as missing_key:
+                urlopen(Request(f"{origin}{control.TAPE_PATH}/start", method="POST", headers=auth))
+            self.assertEqual(missing_key.exception.code, 400)
+            missing_key.exception.close()
+            with urlopen(
+                Request(
+                    f"{origin}{control.TAPE_PATH}/start",
+                    method="POST",
+                    headers={**auth, "Idempotency-Key": "http-tape"},
+                )
+            ) as response:
+                self.assertEqual(response.status, 202)
+            with self.assertRaises(HTTPError) as no_file:
+                urlopen(Request(f"{origin}{control.RECORDING_FILE_PATH}", headers=auth))
+            self.assertEqual(no_file.exception.code, 404)
+            no_file.exception.close()
+            with urlopen(
+                Request(
+                    f"{origin}{control.TAPE_PATH}/stop",
+                    method="POST",
+                    headers={**auth, "Idempotency-Key": "http-tape-stop"},
+                )
+            ) as response:
+                self.assertEqual(response.status, 200)
+
+            media = self.root / "program.mp4"
+            media.write_bytes(bytes(range(256)) * 8)
+            self.recording.artifact_path = media
+            with urlopen(Request(f"{origin}{control.RECORDING_FILE_PATH}", headers=auth)) as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.headers["Content-Type"], "video/mp4")
+                self.assertIn("attachment", response.headers["Content-Disposition"])
+                self.assertEqual(response.read(), media.read_bytes())
+            with urlopen(
+                Request(f"{origin}{control.RECORDING_FILE_PATH}", headers={**auth, "Range": "bytes=10-19"})
+            ) as response:
+                self.assertEqual(response.status, 206)
+                self.assertEqual(response.headers["Content-Range"], "bytes 10-19/2048")
+                self.assertEqual(response.read(), media.read_bytes()[10:20])
+            with self.assertRaises(HTTPError) as past_end:
+                urlopen(Request(f"{origin}{control.RECORDING_FILE_PATH}", headers={**auth, "Range": "bytes=9999-"}))
+            self.assertEqual(past_end.exception.code, 416)
+            past_end.exception.close()
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 class CroccanteClientContractTests(unittest.TestCase):
