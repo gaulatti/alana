@@ -338,6 +338,33 @@ class RecordingContractTests(unittest.TestCase):
             publication.terminate()
             publication.wait(timeout=5)
 
+    def test_final_artifact_requires_a_verified_complete_recording(self):
+        controller = RecordingController(
+            self.root, enabled=True, ready=lambda: True, start_monitor=False
+        )
+        state = controller.store.load(enabled=True)
+        self.assertIsNone(controller.final_artifact())
+
+        operation_id = "a" * 16
+        operation_dir = controller.store.operation_dir(operation_id)
+        operation_dir.mkdir(parents=True)
+        complete = {**state, "state": "complete", "operationId": operation_id,
+                    "finalizationState": "pending"}
+        controller.store.save(complete)
+        self.assertIsNone(controller.final_artifact())
+
+        controller.store.save({**complete, "finalizationState": "verified",
+                               "operationId": "not-a-valid-operation"})
+        self.assertIsNone(controller.final_artifact())
+
+        controller.store.save({**complete, "finalizationState": "verified"})
+        self.assertIsNone(controller.final_artifact())  # no program.mp4 yet
+
+        (operation_dir / "program.mp4").write_bytes(b"mp4")
+        path, public = controller.final_artifact()
+        self.assertEqual(path, operation_dir / "program.mp4")
+        self.assertEqual(public["state"], "complete")
+
     def test_disabled_default_has_no_recorder_process_or_side_effect(self):
         controller = RecordingController(
             self.root,
