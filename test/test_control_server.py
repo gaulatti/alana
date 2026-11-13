@@ -1,4 +1,6 @@
+import http.client
 import importlib.util
+import io
 import json
 import os
 import tempfile
@@ -7,6 +9,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.error import HTTPError
+from unittest import mock
 from urllib.request import Request, urlopen
 
 
@@ -944,6 +947,192 @@ class TapeTests(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+
+class TapePipelineTests(unittest.TestCase):
+    def test_tape_mode_is_private_and_ready_without_publishers(self):
+        pipeline = control.SubprocessPipeline()
+        process = mock.Mock()
+        process.poll.return_value = None
+        with mock.patch.object(control.subprocess, "Popen", return_value=process) as popen:
+            pipeline.start(tape=True)
+        self.assertTrue(pipeline.tape)
+        self.assertEqual(popen.call_args.kwargs["env"]["TAPE_MODE"], "1")
+        with mock.patch.object(control, "pid_alive", return_value=True):
+            self.assertTrue(pipeline.ready())
+        with mock.patch.object(control, "pid_alive", return_value=False):
+            self.assertFalse(pipeline.ready())
+        process.pid = 4242
+        with mock.patch.object(control.os, "killpg") as killpg:
+            pipeline.stop()
+        killpg.assert_called_once()
+        self.assertFalse(pipeline.tape)
+
+    def test_live_start_keeps_the_environment_and_requires_publishers(self):
+        pipeline = control.SubprocessPipeline()
+        process = mock.Mock()
+        process.poll.return_value = None
+        with mock.patch.object(control.subprocess, "Popen", return_value=process) as popen:
+            pipeline.start()
+            pipeline.start()  # already running: no second launch
+        self.assertEqual(popen.call_count, 1)
+        self.assertIsNone(popen.call_args.kwargs["env"])
+        self.assertFalse(pipeline.tape)
+        with mock.patch.object(control, "pid_alive", return_value=True), \
+                mock.patch.object(control.SubprocessPipeline, "_progressing", return_value=False):
+            self.assertFalse(pipeline.ready())
+
+
+class TapeControllerEdgeTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.events = []
+        control.METRICS = control.Metrics(self.root / "runtime-metrics.json")
+        self.manager = control.LifecycleManager(
+            control.StateStore(self.root),
+            FakePipeline(self.events),
+            FakeCroccante(self.events),
+            sleep=lambda _: None,
+            ready_timeout=1,
+            start_monitor=False,
+        )
+        self.recording = FakeRecording()
+        self.tape = control.TapeController(
+            lambda: self.manager, lambda: self.recording, self.root,
+            sleep=lambda _: None, ready_timeout=1,
+        )
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_second_start_is_rejected_while_a_tape_runs(self):
+        self.tape.command("start", "tape-1")
+        status, payload = self.tape.command("start", "tape-2")
+        self.assertEqual(status, 409)
+        self.assertEqual(payload["commandResult"]["result"], "already-active")
+
+    def test_recorder_rejection_tears_down_and_reports_its_reason(self):
+        self.recording.command = lambda action, key: (
+            507, {**self.recording.state, "commandResult": {"result": "disk-exhausted"}}
+        )
+        status, payload = self.tape.command("start", "tape-1")
+        self.assertEqual(status, 507)
+        self.assertEqual(payload["commandResult"]["result"], "disk-exhausted")
+        self.assertFalse(self.tape.active)
+        self.assertEqual(self.events[-1], "pipeline:stop")
+
+    def test_recorder_rejection_without_a_reason_defaults_to_capture_failed(self):
+        self.recording.command = lambda action, key: (503, dict(self.recording.state))
+        status, payload = self.tape.command("start", "tape-1")
+        self.assertEqual(payload["commandResult"]["result"], "capture-failed")
+
+    def test_tape_accessor_requires_initialization(self):
+        control.TAPE = None
+        with self.assertRaises(RuntimeError):
+            control.tape()
+
+    def test_malformed_content_length_and_bodies_are_rejected(self):
+        token_file = self.root / "control-token"
+        token_file.write_text("api-secret\n")
+        control.CONTROL_TOKEN_FILE = token_file
+        control.MANAGER = self.manager
+        control.RECORDER = self.recording
+        control.TAPE = self.tape
+        server = control.ThreadingHTTPServer(("127.0.0.1", 0), control.Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            def post(headers, body=None):
+                connection = http.client.HTTPConnection("127.0.0.1", server.server_port)
+                connection.putrequest("POST", f"{control.TAPE_PATH}/start")
+                connection.putheader("Authorization", "Bearer api-secret")
+                for name, value in headers.items():
+                    connection.putheader(name, value)
+                connection.endheaders(body)
+                response = connection.getresponse()
+                response.read()
+                connection.close()
+                return response.status
+
+            self.assertEqual(post({"Idempotency-Key": "k", "Content-Length": "abc"}), 400)
+            self.assertEqual(post({"Idempotency-Key": "k", "Content-Length": "1"}, b"x"), 400)
+            self.assertEqual(post({"Idempotency-Key": "k" * 201, "Content-Length": "0"}), 400)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_range_variants_and_short_reads(self):
+        class Artifact:
+            def __init__(self, data, size):
+                self.data, self.size = data, size
+
+            def stat(self):
+                return mock.Mock(st_size=self.size)
+
+            def open(self, mode):
+                return io.BytesIO(self.data)
+
+        token_file = self.root / "control-token"
+        token_file.write_text("api-secret\n")
+        control.CONTROL_TOKEN_FILE = token_file
+        control.MANAGER = self.manager
+        control.RECORDER = self.recording
+        control.TAPE = self.tape
+        server = control.ThreadingHTTPServer(("127.0.0.1", 0), control.Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        origin = f"http://127.0.0.1:{server.server_port}"
+        auth = {"Authorization": "Bearer api-secret"}
+
+        def fetch(range_header=None):
+            headers = dict(auth)
+            if range_header:
+                headers["Range"] = range_header
+            try:
+                with urlopen(Request(f"{origin}{control.RECORDING_FILE_PATH}", headers=headers)) as response:
+                    return response.status, response.headers, response.read()
+            except HTTPError as error:
+                error.close()
+                return error.code, error.headers, b""
+
+        try:
+            data = bytes(range(100))
+            self.recording.state = {**self.recording.state, "state": "complete"}
+            self.recording.artifact_path = Artifact(data, 100)
+            self.assertEqual(fetch("bytes=-10")[2], data[-10:])          # suffix range
+            self.assertEqual(fetch("bytes=90-")[2], data[90:])           # open-ended range
+            self.assertEqual(fetch("garbage")[0], 416)                   # malformed
+            self.assertEqual(fetch("bytes=-")[0], 416)                   # empty range
+            self.assertEqual(fetch("bytes=200-300")[0], 416)             # past the end
+            # The file shrinks after stat: the stream stops instead of spinning.
+            self.recording.artifact_path = Artifact(data[:10], 100)
+            with self.assertRaises(http.client.IncompleteRead) as truncated:
+                fetch()
+            self.assertEqual(len(truncated.exception.partial), 10)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+class MainWiringTests(unittest.TestCase):
+    def test_main_wires_tape_into_the_lifecycle_and_shuts_down_cleanly(self):
+        server = mock.Mock()
+        server.serve_forever.side_effect = KeyboardInterrupt
+        with tempfile.TemporaryDirectory() as temp, \
+                mock.patch.object(control, "STATE_DIR", Path(temp)), \
+                mock.patch.object(control.subprocess, "run"), \
+                mock.patch.object(control, "StateStore"), \
+                mock.patch.object(control, "SubprocessPipeline"), \
+                mock.patch.object(control, "CroccanteClient"), \
+                mock.patch.object(control, "LifecycleManager") as manager_class, \
+                mock.patch.object(control, "RecordingController") as recorder_class, \
+                mock.patch.object(control, "ThreadingHTTPServer", return_value=server), \
+                mock.patch.object(control.signal, "signal"):
+            control.main()
+            wired = control.TAPE
+            self.assertIs(manager_class.return_value.tape_active.__self__, wired)
+            self.assertFalse(wired.is_active())
+        recorder_class.return_value.close.assert_called_once()
+        server.server_close.assert_called_once()
 
 
 class CroccanteClientContractTests(unittest.TestCase):
