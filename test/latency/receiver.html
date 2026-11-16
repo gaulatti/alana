@@ -1,0 +1,17 @@
+<!doctype html><meta charset="utf-8"><title>Local LiveKit receiver</title>
+<style>html,body{margin:0;overflow:hidden;background:black}video{display:block;width:100vw;height:100vh;object-fit:fill}</style>
+<video autoplay playsinline muted aria-label="Received program"></video>
+<script src="/sdk.js"></script>
+<script>
+(async()=>{
+  try{
+    const config=await (await fetch('/config',{cache:'no-store'})).json();
+    const room=new LivekitClient.Room({adaptiveStream:false,dynacast:false});
+    window.latencyRoom=room;
+    room.on(LivekitClient.RoomEvent.TrackSubscribed,(track)=>{
+      if(track.kind===LivekitClient.Track.Kind.Video){track.attach(document.querySelector('video'));}
+    });
+    await room.connect(config.url,config.token);
+  }catch{document.body.dataset.failure='receiver-connect-failed';}
+})();
+</script>

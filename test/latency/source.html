@@ -1,0 +1,19 @@
+<!doctype html><meta charset="utf-8"><title>Local latency source</title>
+<style>html,body{margin:0;overflow:hidden;background:black}canvas{width:100vw;height:100vh}</style>
+<canvas width="640" height="360" aria-label="Timestamp beacon"></canvas>
+<script>
+const ctx=document.querySelector('canvas').getContext('2d');
+function draw(){
+  const stamp=BigInt(Date.now());
+  const word=(0xa55an<<48n)|stamp;
+  ctx.fillStyle='#111';ctx.fillRect(0,0,640,360);
+  for(let i=0;i<64;i++){
+    ctx.fillStyle=(word&(1n<<BigInt(63-i)))?'white':'black';
+    ctx.fillRect(i*10,0,10,32);
+  }
+  ctx.fillStyle='white';ctx.font='32px monospace';ctx.fillText(String(stamp),20,120);
+  ctx.font='20px sans-serif';ctx.fillText('Harbor Light — local latency fixture',20,200);
+  requestAnimationFrame(draw);
+}
+requestAnimationFrame(draw);
+</script>
