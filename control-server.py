@@ -15,7 +15,7 @@ import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urlsplit
 from urllib.request import Request, urlopen
@@ -64,6 +64,35 @@ FILLER_FAILURE_REASONS = frozenset(
 )
 
 
+UNRECOGNIZED_LOG_KEYS = 8
+UNRECOGNIZED_LOG_KEY_LENGTH = 40
+FILLER_STATUSES = frozenset({"failed", "unprepared", "preparing"})
+
+
+def note_unrecognized(boundary: str, kind: str, names: Iterable[object] = ()) -> None:
+    """Count and log input Alana ignores: key names only, never values."""
+    METRICS.observe_unrecognized(boundary, kind)
+    shown = sorted(
+        re.sub(r"[^A-Za-z0-9._-]", "?", str(name))[:UNRECOGNIZED_LOG_KEY_LENGTH]
+        for name in names
+    )
+    more = len(shown) - UNRECOGNIZED_LOG_KEYS
+    keys = ",".join(shown[:UNRECOGNIZED_LOG_KEYS]) + (f",+{more}" if more > 0 else "")
+    print(
+        f"[control] ignored unrecognized input boundary={boundary} kind={kind}"
+        + (f" keys={keys}" if keys else ""),
+        flush=True,
+    )
+
+
+def ignore_unknown_keys(
+    payload: dict[object, object], known: set[str], boundary: str
+) -> None:
+    unknown = [key for key in payload if key not in known]
+    if unknown:
+        note_unrecognized(boundary, "unknown_field", unknown)
+
+
 def now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -85,10 +114,16 @@ def atomic_json(path: Path, payload: dict[str, object]) -> None:
 
 
 def parse_destination_selection(
-    payload: object, *, expected_version: str | None = None
+    payload: object,
+    *,
+    expected_version: str | None = None,
+    boundary: str = "destinations_start",
 ) -> dict[str, object]:
-    """Validate the transport-only Croccante selection without resolving it."""
-    if not isinstance(payload, dict) or set(payload) != {"version", "destinations"}:
+    """Validate the transport-only Croccante selection without resolving it.
+
+    Required fields must be present and valid; fields Alana does not recognize
+    are ignored, counted, and never forwarded."""
+    if not isinstance(payload, dict) or not {"version", "destinations"} <= set(payload):
         raise ValueError("invalid destination selection")
     version = payload.get("version")
     destinations = payload.get("destinations")
@@ -99,11 +134,12 @@ def parse_destination_selection(
     if not isinstance(destinations, list) or not 1 <= len(destinations) <= MAX_DESTINATIONS:
         raise ValueError("invalid destination count")
 
+    item_keys = {"id", "secretId", "versionId"}
+    if not all(isinstance(item, dict) and item_keys <= set(item) for item in destinations):
+        raise ValueError("invalid destination reference")
     normalized: list[dict[str, str]] = []
     seen: set[str] = set()
     for item in destinations:
-        if not isinstance(item, dict) or set(item) != {"id", "secretId", "versionId"}:
-            raise ValueError("invalid destination reference")
         destination_id = item.get("id")
         secret_id = item.get("secretId")
         version_id = item.get("versionId")
@@ -121,6 +157,10 @@ def parse_destination_selection(
         normalized.append(
             {"id": destination_id, "secretId": secret_id, "versionId": version_id}
         )
+    ignore_unknown_keys(payload, {"version", "destinations"}, boundary)
+    unknown_item_keys = {key for item in destinations for key in item if key not in item_keys}
+    if unknown_item_keys:
+        note_unrecognized(boundary, "unknown_field", unknown_item_keys)
     return {"version": version, "destinations": normalized}
 
 
@@ -668,10 +708,13 @@ class CroccanteClient:
         safe_profile = (
             {key: profile[key] for key in profile_keys}
             if isinstance(profile, dict)
-            and set(profile) == profile_keys
+            and profile_keys <= set(profile)
             and all(isinstance(profile[key], (int, str)) for key in profile_keys)
             else None
         )
+        if safe_profile is not None:
+            assert isinstance(profile, dict)
+            ignore_unknown_keys(profile, profile_keys, "filler_profile")
         ready_fields_valid = bool(
             isinstance(source_id, str)
             and FILLER_IDENTIFIER.fullmatch(source_id)
@@ -682,15 +725,20 @@ class CroccanteClient:
             and safe_profile is not None
         )
         ready = source.get("ready") is True and ready_fields_valid
+        reported = source.get("status")
+        if ready:
+            status = "ready"
+        elif reported in FILLER_STATUSES:
+            status = str(reported)
+        elif isinstance(reported, str) and reported != "ready":
+            # A status Alana does not recognize is never readiness and never a failure.
+            note_unrecognized("filler_status", "unknown_value")
+            status = "unknown"
+        else:
+            status = "failed"
         result: dict[str, object] = {
             "version": version,
-            "status": (
-                "ready"
-                if ready
-                else source.get("status")
-                if source.get("status") in {"failed", "unprepared"}
-                else "failed"
-            ),
+            "status": status,
             "ready": ready,
         }
         if ready:
@@ -1623,6 +1671,12 @@ class Handler(BaseHTTPRequestHandler):
         )
         print(f"[control] {self.command} route={route} status={status}", flush=True)
 
+    def discard_unexpected_body(self, length: int) -> None:
+        """A command takes no body: ignore one, count it, never parse or log it."""
+        note_unrecognized("command_body", "unexpected_body")
+        if 0 < length <= 65536:
+            self.rfile.read(length)
+
     def send_json(self, status: int, payload: dict[str, object]) -> None:
         body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
         self.send_response(status)
@@ -1784,7 +1838,7 @@ class Handler(BaseHTTPRequestHandler):
                     payload = json.loads(self.rfile.read(length))
                     if (
                         not isinstance(payload, dict)
-                        or set(payload) != {"commandId", "version", "destinations"}
+                        or not {"commandId", "version", "destinations"} <= set(payload)
                         or payload.get("commandId") != key
                     ):
                         raise ValueError
@@ -1794,6 +1848,12 @@ class Handler(BaseHTTPRequestHandler):
                             "destinations": payload["destinations"],
                         },
                         expected_version=version,
+                        boundary="destinations_reload",
+                    )
+                    ignore_unknown_keys(
+                        payload,
+                        {"commandId", "version", "destinations"},
+                        "destinations_reload",
                     )
                 except (json.JSONDecodeError, ValueError):
                     self.send_json(400, {"error": "invalid destination selection"})
@@ -1850,8 +1910,7 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     return
                 if length != 0:
-                    self.send_json(400, {"error": "tape commands do not accept a body"})
-                    return
+                    self.discard_unexpected_body(length)
                 status, payload = tape().command(path.rsplit("/", 1)[1], key)
                 self.send_json(status, payload)
                 return
@@ -1867,8 +1926,7 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     return
                 if length != 0:
-                    self.send_json(400, {"error": "recording commands do not accept a body"})
-                    return
+                    self.discard_unexpected_body(length)
                 action = path.rsplit("/", 1)[1]
                 status, payload = recorder().command(action, key)
                 result = (
@@ -1918,8 +1976,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(400, {"error": "invalid destination selection"})
                     return
             elif length:
-                self.send_json(400, {"error": "Stop does not accept a request body"})
-                return
+                self.discard_unexpected_body(length)
             status, payload = manager().command(
                 action, key, sequence, selection
             )

@@ -40,6 +40,10 @@ DESTINATION_RESULTS = frozenset(
     {"success", "failure", "conflict", "duplicate", "active"}
 )
 LIFECYCLE_STATES = ("stopped", "starting", "running", "stopping", "degraded", "failed", "transitioning", "unknown")
+UNRECOGNIZED_BOUNDARIES = frozenset(
+    {"filler_profile", "filler_status", "destinations_start", "destinations_reload", "command_body"}
+)
+UNRECOGNIZED_KINDS = frozenset({"unknown_field", "unknown_value", "unexpected_body"})
 RECORDING_STATES = (
     "disabled",
     "idle",
@@ -214,6 +218,13 @@ class Metrics:
             {"action": DESTINATION_ACTIONS, "result": DESTINATION_RESULTS},
         )
 
+    def observe_unrecognized(self, boundary: str, kind: str) -> None:
+        self._increment(
+            "alana_unrecognized_input_total",
+            {"boundary": boundary, "kind": kind},
+            {"boundary": UNRECOGNIZED_BOUNDARIES, "kind": UNRECOGNIZED_KINDS},
+        )
+
     @staticmethod
     def _gauge(lines: list[str], name: str, help_text: str, value: float | int, labels: dict[str, str] | None = None) -> None:
         lines.extend((f"# HELP {name} {help_text}", f"# TYPE {name} gauge", f"{name}{_labels(labels or {})} {value}"))
@@ -254,6 +265,7 @@ class Metrics:
             "alana_reconcile_cycles_total": "Lifecycle reconciliation cycles by result.",
             "alana_filler_preparations_total": "Filler preparation and reconciliation outcomes.",
             "alana_destination_operations_total": "Destination validation and reload outcomes.",
+            "alana_unrecognized_input_total": "Inputs ignored because Alana does not recognize them, by bounded boundary and kind.",
         }
         for (name, label_pairs), value in sorted(counters.items()):
             lines.extend((f"# HELP {name} {counter_help[name]}", f"# TYPE {name} counter", f"{name}{_labels(dict(label_pairs))} {value}"))

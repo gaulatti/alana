@@ -120,8 +120,30 @@ result without repeating side effects; old sequences and concurrent transitions
 return 409. Token values, publish URLs, and raw idempotency keys are never stored
 in lifecycle state or emitted by the control server.
 
+### Unrecognized input is ignored and counted
+
+If Alana does not recognize something, it ignores it. Required fields must be
+present and valid, but extra fields and unexpected bodies never refuse a
+command or make a filler unready. Each ignored input increments
+`alana_unrecognized_input_total{boundary,kind}` and writes one log line naming
+the boundary and at most eight unknown key names (sanitized, 40 characters
+each). Values are never logged, forwarded, or persisted.
+
+| Boundary | What is ignored | `kind` |
+| --- | --- | --- |
+| `filler_profile` | Extra fields in Croccante's prepared profile; the nine known fields must still be present as integers or strings | `unknown_field` |
+| `filler_status` | A Croccante filler status other than `ready`, `failed`, `unprepared`, or `preparing`; Alana reports it as `status: "unknown"`, `ready: false` (not ready, not failed) | `unknown_value` |
+| `destinations_start` | Extra fields on the Start selection or on a destination item | `unknown_field` |
+| `destinations_reload` | Extra fields on the reload body or on a destination item | `unknown_field` |
+| `command_body` | Any body sent to lifecycle Stop, recording Start/Stop, or tape Start/Stop | `unexpected_body` |
+
+These checks stay strict because they guard identity and replay safety: the
+destination `id`/`secretId`/`versionId` patterns, the 1-20 count, duplicate IDs,
+the reload path version matching the body version, and `commandId` matching the
+`Idempotency-Key`.
+
 Recording Start/Stop uses the same bearer credential and a bounded
-`Idempotency-Key`, but no command sequence or body. Start returns `202` after
+`Idempotency-Key`, but no command sequence; a body is ignored and counted. Start returns `202` after
 the independent recorder reaches Requested or Active. It fails closed when the
 shared publication pipeline is not ready, recording is disabled, or the disk
 preflight fails. Recording health never changes publication lifecycle state.
@@ -138,8 +160,8 @@ verifies `program.mp4`, then stops the private pipeline. The file is read from
 Tape and live broadcast are mutually exclusive. Tape Start returns 409
 `program-live` while a broadcast is requested, transitioning, or its pipeline is
 running, and a lifecycle Start returns 409 `tape-active` while a tape is
-running. Both use the same bearer credential and a bounded `Idempotency-Key`
-with no body. If the recorder ends on its own (for example disk exhaustion), the
+running. Both use the same bearer credential and a bounded `Idempotency-Key`;
+a body is ignored and counted. If the recorder ends on its own (for example disk exhaustion), the
 next status read tears the private pipeline down. A container restart during a
 tape leaves the recorder awaiting readiness; Stop finalizes the segments already
 captured. Completed recordings are removed by the retention window before a new
@@ -228,7 +250,9 @@ and checksum, artifact checksum, and profile, but never the download URL or a
 credential. Repeating an identical version is safe; changing the semantic
 content of an existing version returns `409`. A failed or interrupted request
 remains visible and retryable, and restart reconciliation checks Croccante's
-durable prepared state without needing the signed URL again.
+durable prepared state without needing the signed URL again. Extra fields in
+Croccante's prepared profile are ignored and dropped; an unrecognized filler
+status is reported as `unknown` and not ready.
 
 Start fails closed until a pending version is ready. Alana passes that exact
 version to Croccante with `X-Filler-Version` and reports Running only when
@@ -256,10 +280,12 @@ Start's JSON body is the exact destination selection authorized by Alcantara:
 }
 ```
 
-The list contains 1-20 unique opaque IDs. Unknown fields, malformed or
-duplicate IDs, invalid references, an oversized body, or a changed selection
-on idempotent replay fail before Alana starts its local output. After local
-readiness, Alana forwards the normalized selection byte-for-byte semantically;
+The list contains 1-20 unique opaque IDs. Malformed or duplicate IDs, invalid
+or missing references, an oversized body, or a changed selection on idempotent
+replay fail before Alana starts its local output. Unknown fields are ignored,
+counted, and dropped from the normalized selection, so they never change the
+selection hash. After local readiness, Alana forwards the normalized selection
+byte-for-byte semantically;
 Croccante resolves every exact secret version and must acknowledge the same
 selection version, SHA-256 selection hash, count, and opaque IDs before Alana
 reports Running. Partial or mismatched downstream state is Degraded, never a
@@ -406,6 +432,7 @@ RTMP legs are aggregated into configured, healthy, and progressing counts.
 | `alana_filler_preparations_total` | Preparation, duplicate, conflict, retry, and reconciliation outcomes | `result` |
 | `alana_destination_operations_total` | Destination reload validation outcomes | `action`, `result` |
 | `alana_recording_commands_total` | Recording Start/Stop outcomes | `action`, `result` |
+| `alana_unrecognized_input_total` | Inputs ignored because Alana does not recognize them | `boundary` (`filler_profile`, `filler_status`, `destinations_start`, `destinations_reload`, `command_body`), `kind` (`unknown_field`, `unknown_value`, `unexpected_body`) |
 | `alana_lifecycle_state` | One-hot actual lifecycle state | `state` |
 | `alana_filler_active` | Whether the current session is bound to a prepared version | none |
 | `alana_filler_pending` | Whether a next-session version is configured | none |

@@ -4,6 +4,10 @@ import os
 import tempfile
 import threading
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
+from unittest.mock import patch
+from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.error import HTTPError
@@ -28,6 +32,14 @@ TEST_DESTINATION_SELECTION = {
         }
     ],
 }
+
+
+def unrecognized_count(boundary, kind):
+    key = (
+        "alana_unrecognized_input_total",
+        (("boundary", boundary), ("kind", kind)),
+    )
+    return control.METRICS.counters.get(key, 0)
 
 
 class FakePipeline:
@@ -472,13 +484,43 @@ class LifecycleTests(unittest.TestCase):
                 "version": "destinations-duplicate",
                 "destinations": one["destinations"] * 2,
             },
-            {
-                "version": "destinations-unknown",
-                "destinations": [{**one["destinations"][0], "url": "rtmp://secret"}],
-            },
+            {"version": "destinations-missing-secret", "destinations": [{"id": "primary", "versionId": "v1"}]},
+            {"destinations": one["destinations"]},
+            {**one, "version": "bad version"},
+            {"version": "destinations-bad-secret", "destinations": [{**one["destinations"][0], "secretId": "no spaces"}]},
         ):
             with self.assertRaises(ValueError):
                 control.parse_destination_selection(invalid)
+        with self.assertRaises(ValueError):
+            control.parse_destination_selection(one, expected_version="destinations-v2")
+
+    def test_destination_selection_ignores_and_counts_unknown_fields(self):
+        one = self.destination_selection()
+        extended = {
+            **one,
+            "label": "never-forwarded",
+            "destinations": [{**one["destinations"][0], "url": "rtmp://secret"}],
+        }
+        with patch("builtins.print") as printed:
+            self.assertEqual(control.parse_destination_selection(extended), one)
+        self.assertEqual(
+            unrecognized_count("destinations_start", "unknown_field"), 2
+        )
+        logged = " ".join(str(call.args[0]) for call in printed.call_args_list)
+        self.assertIn("boundary=destinations_start kind=unknown_field keys=label", logged)
+        self.assertIn("keys=url", logged)
+        self.assertNotIn("rtmp://secret", logged)
+        self.assertNotIn("never-forwarded", logged)
+
+    def test_unknown_key_log_is_truncated_and_capped(self):
+        names = [f"field{index:02d}" for index in range(12)] + ["x" * 90, "bad key!"]
+        with patch("builtins.print") as printed:
+            control.note_unrecognized("filler_profile", "unknown_field", names)
+        line = printed.call_args.args[0]
+        self.assertIn("keys=bad?key?,field00,", line)
+        self.assertTrue(line.endswith(",+6"))
+        self.assertNotIn("x" * 41, line)
+        self.assertNotIn("field11", line)
 
     def test_reload_is_idempotent_and_active_mutation_is_rejected(self):
         selection = self.destination_selection()
@@ -946,6 +988,115 @@ class TapeTests(unittest.TestCase):
             server.server_close()
 
 
+class UnrecognizedHttpInputTests(TapeTests):
+    """Every Alana HTTP boundary ignores and counts what it does not recognize."""
+
+    def setUp(self):
+        super().setUp()
+        token_file = self.root / "control-token"
+        token_file.write_text("api-secret\n")
+        control.CONTROL_TOKEN_FILE = token_file
+        control.MANAGER = self.manager
+        control.RECORDER = self.recording
+        control.TAPE = self.tape
+        self.server = control.ThreadingHTTPServer(("127.0.0.1", 0), control.Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.origin = f"http://127.0.0.1:{self.server.server_port}"
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
+        super().tearDown()
+
+    def send(self, method, path, key, body=None):
+        headers = {"Authorization": "Bearer api-secret", "Idempotency-Key": key}
+        if path.startswith(control.PROGRAM_PATH):
+            self.sequence = getattr(self, "sequence", 0) + 1
+            headers["X-Command-Sequence"] = str(self.sequence)
+        data = None if body is None else json.dumps(body).encode()
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+        request = Request(f"{self.origin}{path}", method=method, data=data, headers=headers)
+        try:
+            with urlopen(request) as response:
+                return response.status, json.loads(response.read())
+        except HTTPError as error:
+            with error:
+                return error.code, json.loads(error.read())
+
+    def test_destination_reload_ignores_unknown_fields_and_keeps_strict_checks(self):
+        selection = LifecycleTests.destination_selection()
+        extended = {
+            "commandId": "reload-extra",
+            **selection,
+            "requestedBy": "operator-name",
+            "destinations": [{**selection["destinations"][0], "label": "Main"}],
+        }
+        path = f"{control.DESTINATION_PATH}{selection['version']}"
+        status, reloaded = self.send("PUT", path, "reload-extra", extended)
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            reloaded["selectionHash"],
+            control.destination_metadata(selection)["selectionHash"],
+        )
+        self.assertEqual(unrecognized_count("destinations_reload", "unknown_field"), 2)
+        bad_secret = [{**selection["destinations"][0], "secretId": "bad secret"}]
+        for key, invalid in (
+            ("reload-mismatch", {**extended, "commandId": "another-command"}),
+            ("reload-version", {**extended, "commandId": "reload-version", "version": "destinations-v2"}),
+            ("reload-missing", {**extended, "commandId": "reload-missing", "destinations": [{"id": "primary"}]}),
+            ("reload-secret", {**extended, "commandId": "reload-secret", "destinations": bad_secret}),
+        ):
+            status, _ = self.send("PUT", path, key, invalid)
+            self.assertEqual(status, 400)
+
+    def test_start_destinations_and_command_bodies_are_ignored_and_counted(self):
+        selection = LifecycleTests.destination_selection()
+        extended = {
+            **selection,
+            "schedule": "later",
+            "destinations": [{**selection["destinations"][0], "label": "Main"}],
+        }
+        status, started = self.send("POST", f"{control.PROGRAM_PATH}/start", "start-extra", extended)
+        self.assertLess(status, 300)
+        self.assertEqual(started["actualState"], "running")
+        self.assertEqual(
+            started["activeDestinations"]["selectionHash"],
+            control.destination_metadata(selection)["selectionHash"],
+        )
+        self.assertEqual(unrecognized_count("destinations_start", "unknown_field"), 2)
+
+        status, stopped = self.send("POST", f"{control.PROGRAM_PATH}/stop", "stop-body", {"reason": "x"})
+        self.assertLess(status, 300)
+        self.assertEqual(stopped["actualState"], "stopped")
+        status, _ = self.send("POST", f"{control.RECORDING_PATH}/start", "record-body", {"note": "x"})
+        self.assertEqual(status, 202)
+        status, _ = self.send("POST", f"{control.RECORDING_PATH}/stop", "record-stop-body", {})
+        self.assertLess(status, 300)
+        status, _ = self.send("POST", f"{control.TAPE_PATH}/start", "tape-body", {"note": "x"})
+        self.assertEqual(status, 202)
+        status, _ = self.send("POST", f"{control.TAPE_PATH}/stop", "tape-stop-body", {"note": "x"})
+        self.assertEqual(status, 200)
+        self.assertEqual(unrecognized_count("command_body", "unexpected_body"), 5)
+
+        # A malformed length is never parsed or read as a body, and never refuses the command.
+        connection = HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)
+        try:
+            connection.putrequest("POST", f"{control.RECORDING_PATH}/stop")
+            connection.putheader("Authorization", "Bearer api-secret")
+            connection.putheader("Idempotency-Key", "record-stop-malformed")
+            connection.putheader("Content-Length", "not-a-number")
+            connection.endheaders()
+            response = connection.getresponse()
+            response.read()
+            self.assertNotEqual(response.status, 400)
+        finally:
+            connection.close()
+        self.assertEqual(unrecognized_count("command_body", "unexpected_body"), 6)
+
+
 class CroccanteClientContractTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -953,6 +1104,9 @@ class CroccanteClientContractTests(unittest.TestCase):
         self.token_file.write_text("outbound-secret\n")
         self.requests = []
         requests = self.requests
+        self.overrides = {}
+        overrides = self.overrides
+        control.METRICS = control.Metrics(Path(self.temp.name) / "runtime-metrics.json")
 
         class DownstreamHandler(BaseHTTPRequestHandler):
             def log_message(self, _format, *_args):
@@ -993,13 +1147,16 @@ class CroccanteClientContractTests(unittest.TestCase):
                         "sourceId": payload["source"]["id"],
                         "sourceSha256": payload["source"]["sha256"],
                         "artifactSha256": "b" * 64,
-                        "profile": payload["profile"],
+                        "profile": {**payload["profile"], **overrides.get("profile", {})},
                         "preparedAt": "2026-08-24T00:00:00Z",
                     }
                 )
 
             def do_GET(self):
                 requests.append(("GET", self.path, dict(self.headers), None))
+                if "/fillers/" in self.path:
+                    self.send_payload(overrides["filler"])
+                    return
                 metadata = control.destination_metadata(TEST_DESTINATION_SELECTION)
                 self.send_payload(
                     {
@@ -1086,6 +1243,46 @@ class CroccanteClientContractTests(unittest.TestCase):
         self.assertEqual(start[2]["X-Command-Sequence"], "9")
         self.assertEqual(start[3], selection)
         self.assertNotIn("downloadUrl", json.dumps(prepared))
+
+    def test_unknown_profile_fields_are_ignored_so_the_filler_stays_ready(self):
+        self.overrides["profile"] = {"pixelFormat": "yuv420p", "colorSpace": "bt709"}
+        payload = LifecycleTests.filler_payload(command="prepare-extra")
+        output = StringIO()
+        with redirect_stdout(output):
+            status, prepared = self.client.prepare("filler-v9", "prepare-extra", payload)
+        self.assertEqual(status, 200)
+        self.assertTrue(prepared["ready"])
+        self.assertEqual(prepared["status"], "ready")
+        self.assertEqual(prepared["profile"], payload["profile"])
+        self.assertEqual(unrecognized_count("filler_profile", "unknown_field"), 1)
+        self.assertIn(
+            "boundary=filler_profile kind=unknown_field keys=colorSpace,pixelFormat",
+            output.getvalue(),
+        )
+        self.assertNotIn("yuv420p", output.getvalue())
+
+        self.overrides["profile"] = {"fps": None}
+        status, broken = self.client.prepare("filler-v9", "prepare-broken", payload)
+        self.assertEqual(status, 502)
+        self.assertFalse(broken["ready"])
+        self.assertEqual(broken["error"], "unexpected-state")
+
+    def test_unknown_filler_status_is_not_ready_rather_than_failed(self):
+        for reported, expected, counted in (
+            ("warming", "unknown", 1),
+            ("preparing", "preparing", 1),
+            ("unprepared", "unprepared", 1),
+            ("ready", "failed", 1),
+            (None, "failed", 1),
+        ):
+            self.overrides["filler"] = {"version": "filler-v9", "status": reported, "ready": False}
+            with redirect_stdout(StringIO()) as output:
+                status, filler = self.client.filler_status("filler-v9")
+            self.assertEqual(status, 404)
+            self.assertFalse(filler["ready"])
+            self.assertEqual(filler["status"], expected)
+            self.assertEqual(unrecognized_count("filler_status", "unknown_value"), counted)
+            self.assertNotIn("warming", output.getvalue())
 
     def test_forwards_stopped_reload_and_reads_redacted_status(self):
         selection = json.loads(json.dumps(TEST_DESTINATION_SELECTION))

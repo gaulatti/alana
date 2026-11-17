@@ -67,6 +67,8 @@ class MetricsTests(unittest.TestCase):
         self.metrics.observe_preparation("not_ready")
         self.metrics.observe_destination("reload", "success")
         self.metrics.observe_recording_command("start", "success")
+        self.metrics.observe_unrecognized("filler_profile", "unknown_field")
+        self.metrics.observe_unrecognized("command_body", "unexpected_body")
         record_runtime_event(self.runtime_path, "stall", "rtmp")
         record_runtime_event(self.runtime_path, "restart", "rtmp", "stall", 5)
         record_runtime_event(self.runtime_path, "fallback", "rtmp")
@@ -82,6 +84,15 @@ class MetricsTests(unittest.TestCase):
             'alana_destination_operations_total{action="reload",result="success"} 1',
             rendered,
         )
+        self.assertIn(
+            'alana_unrecognized_input_total{boundary="filler_profile",kind="unknown_field"} 1',
+            rendered,
+        )
+        self.assertIn(
+            'alana_unrecognized_input_total{boundary="command_body",kind="unexpected_body"} 1',
+            rendered,
+        )
+        self.assertIn("# TYPE alana_unrecognized_input_total counter", rendered)
         self.assertIn("alana_destinations_active 2", rendered)
         self.assertIn("alana_destinations_pending 1", rendered)
         self.assertIn("alana_filler_pending 0", rendered)
@@ -104,6 +115,10 @@ class MetricsTests(unittest.TestCase):
             self.metrics.observe_destination("reload", "program-123")
         with self.assertRaises(ValueError):
             self.metrics.observe_recording_command("start", "program-123")
+        with self.assertRaises(ValueError):
+            self.metrics.observe_unrecognized("pixelFormat", "unknown_field")
+        with self.assertRaises(ValueError):
+            self.metrics.observe_unrecognized("filler_status", "queued")
         with self.assertRaises(ValueError):
             record_runtime_event(self.runtime_path, "restart", "rtmp", "https://private.example", 5)
         with self.assertRaises(ValueError):
