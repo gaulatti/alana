@@ -505,3 +505,99 @@ class SegmentVideoSpanTests(unittest.TestCase):
         for payload in ({"packets": []}, {}, ["packets"], {"packets": [{"pts_time": "0", "duration_time": "0"}]}, {"packets": [{"pts_time": "nan", "duration_time": "1"}]}):
             with self.subTest(payload=payload), self.assertRaises(ValueError):
                 self.probe(payload)
+
+
+class FinalizeJoinTests(unittest.TestCase):
+    """finalize_recording's join, with ffmpeg and ffprobe faked at the subprocess boundary (#32)."""
+
+    OPERATION = "0123456789abcdef"
+
+    def setUp(self):
+        import hashlib
+
+        self.temp = tempfile.TemporaryDirectory()
+        self.store = RecordingStore(Path(self.temp.name))
+        self.operation = self.store.operation_dir(self.OPERATION)
+        self.operation.mkdir(parents=True)
+        self.records = []
+        for sequence in range(3):
+            segment = self.operation / f"segment-{sequence:06d}.mkv"
+            segment.write_bytes(b"fictional segment %d" % sequence)
+            self.records.append({"sequence": sequence, "file": segment.name, "sha256": hashlib.sha256(segment.read_bytes()).hexdigest()})
+        self.state = {
+            "enabled": True, "state": "active", "operationId": self.OPERATION, "segmentCount": 3,
+            "errors": 0, "restarts": 0, "finalizationState": "not-requested",
+        }
+        self.store.save(self.state)
+        self.remuxes = []
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def run_finalize(self, span_answer):
+        """span_answer(segment_name) returns the ffprobe packet JSON, or raises."""
+        from recording import finalize_recording
+
+        def fake_run(command, *args, **kwargs):
+            if command[0] == "ffprobe" and "packet=pts_time,duration_time" in command:
+                return subprocess.CompletedProcess(command, 0, stdout=json.dumps(span_answer(Path(command[-1]).name)), stderr="")
+            if command[0] == "ffmpeg":
+                self.remuxes.append((self.operation / "concat.txt").read_text(encoding="utf-8"))
+                (Path(kwargs["cwd"]) / command[-1]).write_bytes(b"fictional mp4")
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+            raise AssertionError(f"unexpected command {command[0]}")
+
+        metadata = {
+            "bytes": 13, "durationSeconds": 15.0, "videoCodec": "h264", "audioCodec": "aac", "width": 160,
+            "height": 90, "fps": "30/1", "audioRate": 48000, "audioChannels": 2,
+        }
+        with patch("recording.harvest_segments", return_value=self.records), patch("recording.subprocess.run", side_effect=fake_run), \
+                patch("recording.probe_media", return_value=metadata), patch("recording.log_event") as events:
+            result = finalize_recording(self.store, self.state)
+        return result, events
+
+    @staticmethod
+    def packets(first, count=150, step=1 / 30):
+        return {"packets": [{"pts_time": f"{first + index * step:.6f}", "duration_time": f"{step:.6f}"} for index in range(count)]}
+
+    def saved(self):
+        return self.store.load(enabled=True)
+
+    def test_readable_segments_join_exactly_by_their_video_spans(self):
+        result, events = self.run_finalize(lambda name: self.packets(0.021))
+        self.assertTrue(result)
+        self.assertEqual(self.saved()["finalizationMethod"], "exact")
+        self.assertEqual(self.saved()["finalizationState"], "verified")
+        concat = self.remuxes[0]
+        self.assertEqual(concat.count("duration 5.000000\n"), 3)
+        self.assertEqual([line for line in concat.splitlines() if line.startswith("file ")], [f"file '{r['file']}'" for r in self.records])
+        self.assertEqual(json.loads((self.operation / "manifest.json").read_text(encoding="utf-8"))["finalizationMethod"], "exact")
+        self.assertNotIn(unittest.mock.call("finalize", "finalizing", "span-unavailable", 3), events.mock_calls)
+
+    def test_an_unmeasurable_segment_falls_back_to_the_previous_join_and_keeps_the_recording(self):
+        failures = {
+            "no video packets": lambda name: {"packets": []} if name.endswith("1.mkv") else self.packets(0.0),
+            "unreadable timing": lambda name: {"packets": [{"pts_time": "x"}]} if name.endswith("2.mkv") else self.packets(0.0),
+            "probe failure": lambda name: (_ for _ in ()).throw(subprocess.CalledProcessError(1, ["ffprobe"])),
+            "not json": lambda name: (_ for _ in ()).throw(json.JSONDecodeError("bad", "", 0)),
+        }
+        for case, answer in failures.items():
+            with self.subTest(case=case):
+                self.remuxes.clear()
+                self.state.update(state="active", finalizationState="not-requested")
+                self.state.pop("finalizationMethod", None)
+                result, events = self.run_finalize(answer)
+                self.assertTrue(result)
+                saved = self.saved()
+                self.assertEqual((saved["state"], saved["finalizationState"], saved["finalizationMethod"]), ("complete", "verified", "fallback"))
+                self.assertEqual(json.loads((self.operation / "manifest.json").read_text(encoding="utf-8"))["finalizationMethod"], "fallback")
+                self.assertEqual(self.remuxes, ["".join(f"file '{r['file']}'\n" for r in self.records)], "the join before #32, every segment kept")
+                events.assert_any_call("finalize", "finalizing", "span-unavailable", 3)
+                self.assertTrue((self.operation / "program.mp4").exists())
+
+    def test_a_changed_segment_still_fails_before_any_join(self):
+        (self.operation / "segment-000001.mkv").write_bytes(b"changed")
+        result, _ = self.run_finalize(lambda name: self.packets(0.0))
+        self.assertFalse(result)
+        self.assertEqual(self.saved()["finalizationState"], "failed")
+        self.assertEqual(self.remuxes, [])
