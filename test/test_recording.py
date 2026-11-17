@@ -44,6 +44,28 @@ class RecordingContractTests(unittest.TestCase):
         self.assertNotIn("rtmp://", rendered)
         self.assertNotIn("livekit", rendered.lower())
 
+    def test_bounded_capture_bounds_every_input_as_well_as_the_output(self):
+        # The loudness meter branch ends in a sink no output -t reaches; on
+        # ffmpeg 5.1 only input limits let a bounded capture end.
+        for synthetic in (False, True):
+            with self.subTest(synthetic=synthetic):
+                command = capture_command(self.root, 0, 5, synthetic=synthetic, duration=9)
+                inputs = [index for index, value in enumerate(command) if value == "-i"]
+                self.assertEqual(len(inputs), 2)
+                previous = 0
+                for index in inputs:
+                    options = command[previous:index]
+                    self.assertIn("-t", options)
+                    self.assertEqual(options[options.index("-t") + 1], "9")
+                    previous = index + 2
+                output = command[inputs[-1] + 2:]
+                self.assertEqual(output[output.index("-t") + 1], "9")
+
+    def test_unbounded_capture_sets_no_duration(self):
+        for synthetic in (False, True):
+            with self.subTest(synthetic=synthetic):
+                self.assertNotIn("-t", capture_command(self.root, 0, 5, synthetic=synthetic))
+
     def test_capture_calculates_gop_for_fractional_frame_rate(self):
         with patch.dict(os.environ, {"FPS": "30000/1001"}, clear=False):
             command = capture_command(self.root, 0, 5)

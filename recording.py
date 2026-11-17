@@ -477,17 +477,23 @@ def capture_command(
     # PulseAudio starts delivering later. make_zero (below) shifts every stream
     # by one common offset so segments still start at 0.
     command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-copyts"]
+    # A bounded capture also bounds each input: the loudness meter's side branch
+    # ends in a sink that no output limit reaches, so on ffmpeg 5.1 (Debian
+    # bookworm) an output -t alone never stops reading endless inputs.
+    bound = [] if duration is None else ["-t", str(duration)]
     if synthetic:
         resolution = os.environ.get("RECORDING_TEST_RESOLUTION", "640x360")
         fps = os.environ.get("RECORDING_TEST_FPS", "30")
         command.extend(
             [
                 "-re",
+                *bound,
                 "-f",
                 "lavfi",
                 "-i",
                 f"testsrc2=size={resolution}:rate={fps}",
                 "-re",
+                *bound,
                 "-f",
                 "lavfi",
                 "-i",
@@ -499,6 +505,7 @@ def capture_command(
             [
                 "-thread_queue_size",
                 "1024",
+                *bound,
                 "-f",
                 "x11grab",
                 "-draw_mouse",
@@ -511,6 +518,7 @@ def capture_command(
                 display,
                 "-thread_queue_size",
                 "1024",
+                *bound,
                 "-f",
                 "pulse",
                 "-i",
