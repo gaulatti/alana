@@ -14,7 +14,7 @@ import subprocess
 import threading
 import time
 
-from metrics import beacon, summarize
+from timecode import Samples, beacon
 
 ROOT = Path(__file__).parent
 WIDTH = 640
@@ -186,9 +186,8 @@ def run(outputs, seconds, warmup):
                 pass
         beginning = time.monotonic() + warmup
         finish = beginning + seconds
-        values = {name: [] for name in names}
+        collected = Samples(names, seen)
         before = None
-        invalid = {name: 0 for name in names}
         while time.monotonic() < finish:
             if source.poll() is not None:
                 raise RuntimeError('Publisher ended during measurement')
@@ -198,25 +197,10 @@ def run(outputs, seconds, warmup):
                 name, stamp, received = samples.get(timeout=.5)
             except queue.Empty:
                 continue
-            if stamp <= seen[name]:
-                continue
-            seen[name] = stamp
-            if time.monotonic() < beginning:
-                continue
-            latency = received - stamp
-            if latency < 0 or latency >= 60_000:
-                invalid[name] += 1
-            else:
-                values[name].append(latency)
+            collected.add(name, stamp, received, measure=time.monotonic() >= beginning)
         elapsed = time.monotonic() - before[0]
         cpu = (cpu_ticks(source.pid) - before[1]) / os.sysconf('SC_CLK_TCK') / elapsed * 100
-        rows = []
-        for name in names:
-            if len(values[name]) < seconds * FPS / 4 or invalid[name]:
-                raise RuntimeError('Insufficient or invalid rendered timecode samples')
-            rows.append({'outputs': outputs, 'receiver': name, 'samples': len(values[name]),
-                         **summarize(values[name]), 'sender_cpu_percent': cpu})
-        return rows
+        return collected.rows(outputs, seconds * FPS / 4, cpu)
     finally:
         server.shutdown()
         for sid in reversed(sessions):

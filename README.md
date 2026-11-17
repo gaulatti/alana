@@ -604,6 +604,14 @@ target. Production-class combined RTMP+LiveKit soak, measured latency, dropped
 frames, encoder utilization, and network behavior must be recorded before
 promoting a particular program configuration.
 
+The latency harness lives in `test/latency` and is described in
+[docs/latency.md](docs/latency.md): `python3 test/latency/run.py` measures a
+local software display-to-display path (RTMP at 1, 3 and 5 outputs plus the
+LiveKit leg, with publisher CPU), `python3 test/latency/synthetic.py` is its
+labelled synthetic self-test, and `python3 test/latency/report.py` reprints a
+result. No baseline is committed yet, and no physical glass-to-glass, capture
+card, GPU encoder or CDN path has been measured.
+
 ## Failure drills
 
 Before UAT, verify:

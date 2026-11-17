@@ -47,8 +47,9 @@ python3 test/latency/run.py --image alana:local \
   --output test/latency/baseline.json
 ```
 
-The command runs 1, 3 and 5 output cases and prints p50/p95/p99, the number of
-unique rendered source timestamps and publisher CPU. Defaults are 10 seconds of
+The command runs 1, 3 and 5 output cases and prints the table described below:
+p50/p95/p99, the number of unique rendered source timestamps and publisher CPU
+for every RTMP receiver and the LiveKit receiver. Defaults are 10 seconds of
 warmup after **every** receiver has displayed a valid beacon, then 30 seconds of
 measurement per case. For a short diagnostic use `--outputs 1 --seconds 4
 --warmup 1`, writing outside the committed baseline. A missing receiver, invalid
@@ -87,13 +88,74 @@ Croccante readiness. On success, failure or interruption it removes its own
 containers and network and deletes its temporary credential store. It never
 prunes another task's containers, volumes, images or shared build cache.
 
-Run the pixel-decoder/percentile boundary tests with:
+## Result format and the printed table
+
+Both producers write one JSON object, `schema: "alana-latency/v1"`, and print it
+through `test/latency/report.py`, which validates before printing:
+
+- `metadata.kind` is `software-display` (this harness end to end) or
+  `synthetic` (the self-test below). The first printed line names the kind; a
+  synthetic table starts `SYNTHETIC LOOP` and says it is not a measurement of
+  Alana. `physical_display_latency_measured` must be `false`: no supported kind
+  measures a physical panel, camera or CDN path.
+- `metadata.source_commit` (40 hex), `dirty_checkout` and `host` (hardware) are
+  required, and are printed under the kind.
+- `rows[]` holds one row per receiver per case: `outputs` (1, 3 or 5),
+  `receiver` (`rtmp-1`..`rtmp-N` or `livekit`), `samples`, nearest-rank
+  `p50_ms`/`p95_ms`/`p99_ms` and `sender_cpu_percent`. Every case lists every
+  RTMP receiver and the LiveKit receiver exactly once. Only a synthetic row may
+  have `null` CPU (printed `n/a`): it has no publisher.
+
+A missing, unknown, mislabelled or incomplete result fails with
+`Invalid latency result` and prints no table. Reprint a committed result with:
 
 ```sh
-python3 -m unittest discover -s test/latency -p 'test_*.py'
+python3 test/latency/report.py test/latency/baseline.json
 ```
+
+## Synthetic self-test (no Alana, FFmpeg, Docker or display)
+
+```sh
+python3 test/latency/synthetic.py [--seconds 10] [--output FILE]
+```
+
+This draws each 30 fps source timestamp into receiver bands with the same pixel
+layout as `source.html` (RTMP receivers three to a row, as the worker tiles
+them), delays it by injected round numbers (RTMP 1000 ms + 0..100 ms, LiveKit
+200 ms + 0..50 ms, seeded), and decodes it with the same beacon reader, the
+same one-sample-per-new-stamp collector and the same report the real worker
+uses. It proves the decode, deduplication, percentile and table arithmetic.
+Its numbers are the injected delays coming back out, never Alana's latency, and
+the JSON and table both say so. Never commit it as the baseline.
+
+## Tests
+
+The pixel codec, collector, result format and synthetic loop are covered
+without FFmpeg, Docker or a display. `test/latency` is a package, so the
+repository suite (`python3 -m unittest discover -s test -p 'test_*.py'`) runs
+these tests; to run only them:
+
+```sh
+python3 -m unittest discover -s test/latency -t test -p 'test_*.py'
+```
+
+`run.py` and `worker.py` drive Docker, Xvfb, Chromium, FFmpeg/FFplay and a
+local LiveKit server, so they are exercised only by the end-to-end command. The
+CI coverage report omits `test/*`, so the Clouseau changed-line gate does not
+measure this harness.
 
 ## Evidence status
 
-The initial end-to-end qualification and committed baseline are pending. Do not
-use an absent report, a test pass or an image build as measured latency.
+No baseline is committed, and no latency number has been measured. Do not use
+an absent report, a test pass, a synthetic table or an image build as measured
+latency. Parked:
+
+- **Software display-to-display run.** Needs Docker (default Colima) with the
+  built image and the LiveKit server. The last qualification probe failed closed:
+  an RTMP receiver showed a stale timestamp and the LiveKit receiver never
+  yielded a qualified beacon. Both need diagnosis in that environment before
+  `run.py` can produce the baseline.
+- **Physical glass to glass.** A real display, a camera pointed at it (or a
+  photodiode), the capture card and GPU encoder of the on-air rig, and the real
+  CDN/player path. None of these is modelled here; a physical kind will be added
+  to the result format only when such a run exists.

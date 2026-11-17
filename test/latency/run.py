@@ -12,6 +12,8 @@ import subprocess
 import tempfile
 import uuid
 
+from report import SCHEMA, table, validate
+
 ROOT = Path(__file__).resolve().parents[2]
 SERVER = 'livekit/livekit-server:v1.13.4'
 SDK_VERSION = '2.21.0'
@@ -66,6 +68,7 @@ def main():
                        'ffmpeg -version | head -1; chromium --version; lk --version; python3 --version')
     docker_info = json.loads(command('docker', 'info', '--format', '{{json .}}'))
     metadata = {
+        'kind': 'software-display',
         'measurement': 'software-rendered source pixels to decoded receiver framebuffer pixels',
         'physical_display_latency_measured': False,
         'source_commit': command('git', '-C', str(ROOT), 'rev-parse', 'HEAD'),
@@ -129,14 +132,10 @@ def main():
             for name in (worker_name, server_name):
                 subprocess.run(['docker', 'rm', '--force', name], capture_output=True)
             subprocess.run(['docker', 'network', 'rm', network], capture_output=True)
-    report = {'metadata': metadata, 'rows': rows}
+    report = validate({'schema': SCHEMA, 'metadata': metadata, 'rows': rows})
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + '\n')
-    print('outputs receiver samples p50_ms p95_ms p99_ms sender_cpu_%')
-    for row in rows:
-        print(f'{row["outputs"]:7} {row["receiver"]:8} {row["samples"]:7} '
-              f'{row["p50_ms"]:6.1f} {row["p95_ms"]:6.1f} {row["p99_ms"]:6.1f} '
-              f'{row["sender_cpu_percent"]:12.1f}')
+    print(table(report))
 
 
 if __name__ == '__main__':
