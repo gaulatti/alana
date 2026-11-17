@@ -64,6 +64,7 @@ PUBLIC_FIELDS = frozenset(
         "errors",
         "restarts",
         "finalizationState",
+        "finalizationMethod",
         "finalSha256",
         "finalBytes",
         "error",
@@ -675,13 +676,28 @@ def finalize_recording(store: RecordingStore, state: dict[str, object]) -> bool:
             raise ValueError("no segments")
         operation_dir = store.operation_dir(str(state["operationId"]))
         concat_path = operation_dir / "concat.txt"
+        segments = []
+        for record in records:
+            segment = operation_dir / str(record["file"])
+            if sha256_file(segment) != record.get("sha256"):
+                raise ValueError("segment checksum mismatch")
+            segments.append(segment)
+        # Exact: each segment starts where the previous one's video ended. A
+        # recording is never refused for this: if any segment's span cannot be
+        # measured, join by container duration as before (#32), which drifts
+        # slowly but keeps every segment.
+        try:
+            spans: list[float] | None = [segment_video_span(segment) for segment in segments]
+            state["finalizationMethod"] = "exact"
+        except (OSError, ValueError, subprocess.SubprocessError, json.JSONDecodeError):
+            spans = None
+            state["finalizationMethod"] = "fallback"
+            log_event("finalize", "finalizing", "span-unavailable", len(segments))
         with concat_path.open("w", encoding="utf-8") as output:
-            for record in records:
-                segment = operation_dir / str(record["file"])
-                if sha256_file(segment) != record.get("sha256"):
-                    raise ValueError("segment checksum mismatch")
-                # Each segment starts where the previous one's video ended.
-                output.write(f"file '{segment.name}'\nduration {segment_video_span(segment):.6f}\n")
+            for index, segment in enumerate(segments):
+                output.write(f"file '{segment.name}'\n")
+                if spans is not None:
+                    output.write(f"duration {spans[index]:.6f}\n")
             output.flush()
             os.fsync(output.fileno())
         final_path = operation_dir / "program.mp4"

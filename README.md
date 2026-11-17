@@ -177,6 +177,10 @@ The remux places each segment where the previous segment's video ends, not at
 its container duration, which also counts the audio frame that overhangs the
 cut; concatenating by container duration made audio drift about 1.5 ms per
 second ahead of video over the recording.
+A recording is never refused for this: if any segment's video span cannot be
+measured, the remux joins by container duration as before, keeps every
+segment, logs `event=finalize state=finalizing result=span-unavailable`, and
+records `finalizationMethod` `fallback` (otherwise `exact`) in the manifest.
 
 Free space and all retained bytes below the recording root, including state and
 idempotency command records, are checked before Start and while recording.

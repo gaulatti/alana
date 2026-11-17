@@ -440,21 +440,53 @@ class RecordingDriftTests(unittest.TestCase):
         self.assertLessEqual(max(offsets) - min(offsets), 10, f"drift across the program: {offsets}")
         self.assertLessEqual(max(abs(offset) for offset in offsets), 40, offsets)
 
-    def test_unreadable_segment_timing_fails_finalization_closed(self):
+    def test_unmeasurable_segments_still_finalize_by_the_previous_join(self):
+        from recording import finalize_recording
+
+        real_run = subprocess.run
+        for name, answer in (("no video packets", {"packets": []}), ("unreadable timing", {"packets": [{"pts_time": "x"}]}), ("probe failure", None)):
+            with self.subTest(case=name):
+                self.temp.cleanup()
+                self.temp = tempfile.TemporaryDirectory()
+                self.root = Path(self.temp.name)
+                store, state = self.capture_flash_and_beep(11)
+
+                def span_probe_breaks(command, *args, _answer=answer, **kwargs):
+                    if "packet=pts_time,duration_time" in command:
+                        if _answer is None:
+                            raise subprocess.CalledProcessError(1, command)
+                        return subprocess.CompletedProcess(command, 0, stdout=json.dumps(_answer), stderr="")
+                    return real_run(command, *args, **kwargs)
+
+                with patch("recording.subprocess.run", side_effect=span_probe_breaks), patch("recording.log_event") as events:
+                    self.assertTrue(finalize_recording(store, state))
+                operation = store.operation_dir("0123456789abcdef")
+                self.assertTrue((operation / "program.mp4").stat().st_size > 0)
+                saved = store.load(enabled=True)
+                self.assertEqual((saved["state"], saved["finalizationState"], saved["finalizationMethod"]), ("complete", "verified", "fallback"))
+                self.assertEqual(json.loads((operation / "manifest.json").read_text(encoding="utf-8"))["finalizationMethod"], "fallback")
+                self.assertGreaterEqual(len(list(operation.glob("segment-*.mkv"))), 3, "every segment is kept")
+                self.assertNotIn("duration", (operation / "concat.txt").read_text(encoding="utf-8"))
+                events.assert_any_call("finalize", "finalizing", "span-unavailable", saved["segmentCount"])
+
+    def test_a_changed_segment_still_fails_finalization(self):
         from recording import finalize_recording
 
         store, state = self.capture_flash_and_beep(6)
-        real_run = subprocess.run
-
-        def unreadable(command, *args, **kwargs):
-            if "packet=pts_time,duration_time" in command:
-                return subprocess.CompletedProcess(command, 0, stdout=json.dumps({"packets": [{"pts_time": "x"}]}), stderr="")
-            return real_run(command, *args, **kwargs)
-
-        with patch("recording.subprocess.run", side_effect=unreadable):
-            self.assertFalse(finalize_recording(store, state))
-        self.assertFalse((store.operation_dir("0123456789abcdef") / "program.mp4").exists())
+        segment = sorted(store.operation_dir("0123456789abcdef").glob("segment-*.mkv"))[0]
+        with segment.open("ab") as handle:
+            handle.write(b"\x00")
+        self.assertFalse(finalize_recording(store, state))
         self.assertEqual(store.load(enabled=True)["finalizationState"], "failed")
+
+    def test_measurable_segments_finalize_by_the_exact_join(self):
+        from recording import finalize_recording
+
+        store, state = self.capture_flash_and_beep(11)
+        self.assertTrue(finalize_recording(store, state))
+        operation = store.operation_dir("0123456789abcdef")
+        self.assertEqual(store.load(enabled=True)["finalizationMethod"], "exact")
+        self.assertEqual((operation / "concat.txt").read_text(encoding="utf-8").count("duration "), store.load(enabled=True)["segmentCount"])
 
 
 class SegmentVideoSpanTests(unittest.TestCase):
