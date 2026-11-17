@@ -1,10 +1,16 @@
+import io
+import json
 import os
 import re
+import runpy
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from alana_metrics import Metrics, record_runtime_event
+import alana_metrics
+from alana_metrics import Metrics, monitor_loudness, record_loudness, record_runtime_event
 
 
 SAMPLE = re.compile(
@@ -146,6 +152,135 @@ class MetricsTests(unittest.TestCase):
         for value in secret_values:
             self.assertNotIn(value, rendered)
         self.assertIn('version="unknown"', rendered)
+
+
+# ffmpeg ametadata=mode=print output for two ebur128 frames.
+FRAMES = """frame:0    pts:0       pts_time:0
+lavfi.r128.M=-120.691
+lavfi.r128.S=-120.691
+lavfi.r128.I=-70.000
+lavfi.r128.LRA=0.000
+lavfi.r128.true_peaks_ch0=0.125
+lavfi.r128.true_peak=0.125
+frame:1    pts:4800    pts_time:0.1
+lavfi.r128.M=-15.900
+lavfi.r128.S=-16.200
+lavfi.r128.I=-16.100
+lavfi.r128.true_peak=0.794328
+""".splitlines()
+
+
+class FakeClock:
+    def __init__(self, *readings):
+        self.readings = list(readings)
+
+    def __call__(self):
+        return self.readings.pop(0)
+
+
+class LoudnessMetricsTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.runtime_path = Path(self.temp.name) / "runtime.json"
+        self.loudness_dir = Path(self.temp.name) / "loudness"
+        self.metrics = Metrics(self.runtime_path)
+        environment = mock.patch.dict(os.environ)
+        environment.start()
+        self.addCleanup(environment.stop)
+        for name in ("ALANA_PROCESSED_AUDIO", "ALANA_LOUDNESS_TARGET", "ALANA_TRUE_PEAK_CEILING"):
+            os.environ.pop(name, None)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def samples(self):
+        rendered = self.metrics.render({})
+        for line in rendered.splitlines():
+            if line and not line.startswith("#"):
+                self.assertRegex(line, SAMPLE)
+        return rendered
+
+    def read(self, output):
+        return json.loads((self.loudness_dir / f"{output}.json").read_text(encoding="utf-8"))
+
+    def test_monitor_keeps_latest_loudness_and_highest_true_peak_in_dbtp(self):
+        writes = monitor_loudness(FRAMES, self.loudness_dir / "rtmp-1.json", interval=1.0, clock=FakeClock(0.0, *[0.5] * 7), wallclock=FakeClock(100.0, 101.0))
+        self.assertEqual(writes, 2)
+        self.assertEqual(self.read("rtmp-1"), {"values": {"momentary": -15.9, "short_term": -16.2, "integrated": -16.1, "true_peak": -2.0}, "updated": 101.0})
+        self.assertFalse((self.loudness_dir / "rtmp-1.json.tmp").exists())
+
+    def test_monitor_ignores_other_lines_and_non_finite_values(self):
+        lines = ["Stream mapping:", "lavfi.r128.M=-inf", "lavfi.r128.true_peak=0.000", "lavfi.r128.LRA=4.0", "noise"]
+        self.assertEqual(monitor_loudness(lines, self.loudness_dir / "livekit.json"), 0)
+        self.assertFalse((self.loudness_dir / "livekit.json").exists())
+
+    def test_monitor_writes_again_once_the_interval_elapses(self):
+        writes = monitor_loudness(FRAMES[:3], self.loudness_dir / "recording.json", interval=1.0, clock=FakeClock(0.0, 1.0), wallclock=FakeClock(5.0, 6.0))
+        self.assertEqual(writes, 2)
+        self.assertEqual(self.read("recording"), {"values": {"momentary": -120.691, "short_term": -120.691}, "updated": 6.0})
+
+    def test_render_exports_loudness_per_output_with_bounded_labels(self):
+        for output, value in (("rtmp-1", -16.1), ("rtmp-12", -16.3), ("livekit", -15.8), ("recording", -16.0)):
+            record_loudness(self.loudness_dir / f"{output}.json", {"momentary": -15.0, "short_term": -16.0, "integrated": value, "true_peak": -1.5}, 1700000000.5)
+        record_loudness(self.loudness_dir / "program-123.json", {"integrated": -1.0}, 1.0)
+        (self.loudness_dir / "notes.txt").write_text("x", encoding="utf-8")
+        rendered = self.samples()
+        self.assertIn("alana_audio_processing_enabled 1", rendered)
+        self.assertIn("alana_audio_loudness_target_lufs -16.0", rendered)
+        self.assertIn("alana_audio_true_peak_ceiling_dbtp -1.0", rendered)
+        self.assertIn('alana_audio_loudness_lufs{output="rtmp-1",window="integrated"} -16.1', rendered)
+        self.assertIn('alana_audio_loudness_lufs{output="livekit",window="momentary"} -15.0', rendered)
+        self.assertIn('alana_audio_loudness_lufs{output="recording",window="short_term"} -16.0', rendered)
+        self.assertIn('alana_audio_true_peak_dbtp{output="rtmp-12"} -1.5', rendered)
+        self.assertIn('alana_audio_loudness_updated_timestamp_seconds{output="recording"} 1700000000.500000', rendered)
+        self.assertEqual(set(re.findall(r'output="([^"]+)"', rendered)), {"rtmp-1", "rtmp-12", "livekit", "recording"})
+        self.assertEqual(rendered.count("# TYPE alana_audio_loudness_lufs gauge"), 1)
+
+    def test_render_reports_configured_values(self):
+        os.environ["ALANA_LOUDNESS_TARGET"] = "-23"
+        os.environ["ALANA_TRUE_PEAK_CEILING"] = "-2"
+        rendered = self.samples()
+        self.assertIn("alana_audio_loudness_target_lufs -23.0", rendered)
+        self.assertIn("alana_audio_true_peak_ceiling_dbtp -2.0", rendered)
+
+    def test_render_omits_corrupt_or_missing_measurements(self):
+        os.environ["ALANA_LOUDNESS_TARGET"] = "loud"
+        rendered = self.samples()
+        self.assertNotIn("alana_audio_loudness_target_lufs", rendered)
+        self.assertNotIn("alana_audio_loudness_lufs", rendered)
+        self.loudness_dir.mkdir()
+        for corrupt in ("{not json", json.dumps(["values"]), json.dumps({"values": {"momentary": True, "short_term": None, "integrated": "nan", "true_peak": [1]}, "updated": "soon"})):
+            (self.loudness_dir / "rtmp-1.json").write_text(corrupt, encoding="utf-8")
+            rendered = self.samples()
+            self.assertNotIn("alana_audio_loudness_lufs", rendered)
+            self.assertNotIn("alana_audio_true_peak_dbtp", rendered)
+            self.assertNotIn("alana_audio_loudness_updated_timestamp_seconds", rendered)
+
+    def test_unreadable_loudness_directory_renders_no_measurements(self):
+        with mock.patch.object(Path, "glob", side_effect=OSError("denied")):
+            rendered = self.samples()
+        self.assertIn("alana_audio_processing_enabled 1", rendered)
+        self.assertNotIn("alana_audio_loudness_lufs", rendered)
+
+    def test_kill_switch_reports_processing_off_and_no_loudness(self):
+        os.environ["ALANA_PROCESSED_AUDIO"] = "off"
+        record_loudness(self.loudness_dir / "rtmp-1.json", {"integrated": -16.0}, 1.0)
+        rendered = self.samples()
+        self.assertIn("alana_audio_processing_enabled 0", rendered)
+        self.assertNotIn("alana_audio_loudness", rendered)
+        self.assertNotIn("alana_audio_true_peak", rendered)
+
+    def test_loudness_monitor_command_reads_ffmpeg_stderr_from_stdin(self):
+        path = self.loudness_dir / "rtmp-1.json"
+        stdin = io.TextIOWrapper(io.BytesIO(("\n".join(FRAMES) + "\n\xff\n").encode("latin-1")))
+        with mock.patch.object(sys, "argv", ["alana_metrics.py", "loudness-monitor", str(path)]), mock.patch.object(sys, "stdin", stdin):
+            runpy.run_path(alana_metrics.__file__, run_name="__main__")
+        self.assertEqual(self.read("rtmp-1")["values"]["integrated"], -16.1)
+
+    def test_loudness_monitor_command_rejects_other_arguments(self):
+        for argv in ([], ["loudness-monitor"], ["other", "path"]):
+            with self.assertRaises(SystemExit):
+                alana_metrics.main(argv)
 
 
 if __name__ == "__main__":

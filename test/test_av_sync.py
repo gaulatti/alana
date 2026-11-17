@@ -29,9 +29,13 @@ AUDIO_START = VIDEO_START + 2
 
 
 def startup_encoders() -> dict[str, str]:
-    text = (REPO / "startup.sh").read_text(encoding="utf-8").replace("\\\n", " ")
-    commands = [line for line in text.splitlines() if " ffmpeg " in line and "x11grab" in line]
-    return {("rtmp" if "-f flv" in line else "livekit"): line for line in commands}
+    """Each encoder's ffmpeg argument list in startup.sh, as one line."""
+    text = (REPO / "startup.sh").read_text(encoding="utf-8")
+    commands = {
+        name: " " + " ".join(body.split()) + " "
+        for name, body in re.findall(r"^\s*(rtmp|livekit)_command=\((.*?)\)$", text, re.M | re.S)
+    }
+    return {name: line for name, line in commands.items() if " ffmpeg " in line and "x11grab" in line}
 
 
 class EncoderTimestampContractTests(unittest.TestCase):

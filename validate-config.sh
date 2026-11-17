@@ -50,6 +50,11 @@ case "${ALLOW_SOFTWARE_FALLBACK:-0}" in
     *) fail "ALLOW_SOFTWARE_FALLBACK must be 0 or 1" ;;
 esac
 
+# audio_chain.py owns the processed-audio settings and their bounds.
+chain_error=$(python3 "$(dirname "${BASH_SOURCE[0]}")/audio_chain.py" filter 1:a:0 aout 2>&1 >/dev/null) \
+    || fail "${chain_error:-processed audio settings are invalid}"
+unset chain_error
+
 case "${RECORDING_ENABLED:-0}" in
     0|1) ;;
     *) fail "RECORDING_ENABLED must be 0 or 1" ;;

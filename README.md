@@ -43,6 +43,8 @@ PulseAudio inputs on their shared wallclock (`-copyts`) and shifts all streams
 by one common offset to start at zero (`-avoid_negative_ts make_zero`).
 Zeroing each input on its own put audio about 2 s ahead of video, because the
 PulseAudio input starts delivering after x11grab.
+Each encoder (every RTMP leg, LiveKit and the recorder) applies the same audio
+chain to its own input; see [Programme audio](#programme-audio).
 Container shutdown terminates every tracked browser, encoder, publisher,
 watchdog, and virtual-display process and removes PID/socket state.
 The recorder is a separate opt-in supervisor. Its failure state and restart
@@ -86,6 +88,30 @@ Optional recording:
 | `RECORDING_VIDEO_BITRATE` | `6000k` | Recorder-only H.264 bitrate |
 | `RECORDING_AUDIO_BITRATE` | `128k` | Recorder-only AAC bitrate |
 | `RECORDING_X264_PRESET` | `veryfast` | Recorder-only software encoder preset |
+
+Programme audio:
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `ALANA_PROCESSED_AUDIO` | `on` | `on` runs the 48 kHz loudness chain inside every encoder; `off` is the kill switch and restores the raw encoder arguments exactly |
+| `ALANA_LOUDNESS_TARGET` | `-16` | Integrated loudness target in LUFS, from `-31` to `-10` |
+| `ALANA_TRUE_PEAK_CEILING` | `-1` | True-peak ceiling in dBTP, from `-6` to `-0.5` |
+
+### Programme audio
+
+`audio_chain.py` defines the chain once; `startup.sh` and `recording.py` both
+build their encoder arguments from it, so RTMP, LiveKit and recordings share one
+format (48 kHz stereo) and one set of loudness parameters without sharing a
+process. A restarting output cannot disturb another, and the chain adds about
+5 ms, so lip sync holds. The chain is a causal AGC keyed on a BS.1770 K-weighted
+copy of the programme, a 4x-oversampled limiter 0.5 dB under the ceiling, and an
+ebur128 meter on a side branch. With the switch on, RTMP audio is 48 kHz instead
+of 44.1 kHz. Only new recordings are processed; existing archives are unchanged.
+
+Encoders still run with `-loglevel quiet`; the meter writes only ebur128 frame
+metadata to stderr, which `alana_metrics.py loudness-monitor` turns into one
+file per output under `/run/alana/loudness/` (written at most once a second).
+Rollback is `ALANA_PROCESSED_AUDIO=off`.
 
 ## Broadcast lifecycle API
 
@@ -462,6 +488,11 @@ RTMP legs are aggregated into configured, healthy, and progressing counts.
 | `alana_stream_stalls_total` | Watchdog stalls by leg | `leg` |
 | `alana_restart_backoff_seconds` | Observed restart backoff histogram | `leg` |
 | `alana_software_fallbacks_total` | Explicit software fallbacks | `leg` |
+| `alana_audio_processing_enabled` | Whether encoders apply the loudness chain | none |
+| `alana_audio_loudness_target_lufs` / `alana_audio_true_peak_ceiling_dbtp` | Configured target and ceiling | none |
+| `alana_audio_loudness_lufs` | Measured EBU R128 loudness per output | `output` (`rtmp-N`, `livekit`, `recording`), `window` (`momentary`, `short_term`, `integrated`) |
+| `alana_audio_true_peak_dbtp` | Highest true peak since the output started | `output` |
+| `alana_audio_loudness_updated_timestamp_seconds` | Time of the latest measurement; stale when an output stops | `output` |
 
 For a private in-container check:
 

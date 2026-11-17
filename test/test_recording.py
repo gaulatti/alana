@@ -601,3 +601,74 @@ class FinalizeJoinTests(unittest.TestCase):
         self.assertFalse(result)
         self.assertEqual(self.saved()["finalizationState"], "failed")
         self.assertEqual(self.remuxes, [])
+
+
+class RecordingAudioChainTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        environment = patch.dict(os.environ, {"ALANA_RUNTIME_METRICS_FILE": str(self.root / "runtime-metrics.json")})
+        environment.start()
+        self.addCleanup(environment.stop)
+        for name in ("ALANA_PROCESSED_AUDIO", "ALANA_LOUDNESS_TARGET", "ALANA_TRUE_PEAK_CEILING"):
+            os.environ.pop(name, None)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_recorder_applies_the_same_chain_as_the_broadcast_encoders(self):
+        import audio_chain
+
+        # The switch defaults on: unset in this environment.
+        self.assertNotIn("ALANA_PROCESSED_AUDIO", os.environ)
+        command = capture_command(self.root, 0, 5)
+        graph = command[command.index("-filter_complex") + 1]
+        self.assertEqual(graph, audio_chain.filter_graph("1:a:0", "aout", -16.0, -1.0))
+        self.assertEqual(command[command.index("-filter_complex") + 2 : command.index("-filter_complex") + 4], ["-map", "[aout]"])
+        self.assertNotIn("1:a:0", command[command.index("-filter_complex") + 2 :])
+        self.assertEqual(command[command.index("-ar") + 1], "48000")
+
+    def test_kill_switch_restores_todays_recorder_command(self):
+        os.environ["ALANA_PROCESSED_AUDIO"] = "off"
+        command = capture_command(self.root, 0, 5)
+        self.assertNotIn("-filter_complex", command)
+        self.assertEqual(command[command.index("-map") : command.index("-map") + 4], ["-map", "0:v:0", "-map", "1:a:0"])
+
+    def test_metered_capture_feeds_the_recording_loudness_metric(self):
+        frames = b"frame:0 pts:0\nlavfi.r128.I=-16.200\nlavfi.r128.true_peak=0.5\n"
+        process = subprocess.Popen(["sh", "-c", 'printf "$0" >&2', frames.decode()], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        with patch("recording.subprocess.Popen", return_value=process) as popen, patch("recording.capture_environment", return_value={}):
+            from recording import start_capture
+
+            self.assertIs(start_capture(["ffmpeg"]), process)
+        process.wait()
+        self.assertEqual(popen.call_args.kwargs["stderr"], subprocess.PIPE)
+        path = self.root / "loudness" / "recording.json"
+        expected = {"integrated": -16.2, "true_peak": -6.02}
+        values = None
+        deadline = time.monotonic() + 5
+        # The meter thread writes the first frame at once and the rest at end of stream.
+        while values != expected and time.monotonic() < deadline:
+            try:
+                values = json.loads(path.read_text(encoding="utf-8"))["values"]
+            except (FileNotFoundError, json.JSONDecodeError):
+                pass
+            time.sleep(0.05)
+        self.assertEqual(values, expected)
+
+    def test_unmetered_capture_discards_stderr_with_the_kill_switch(self):
+        os.environ["ALANA_PROCESSED_AUDIO"] = "off"
+        with patch("recording.subprocess.Popen") as popen, patch("recording.capture_environment", return_value={}):
+            from recording import start_capture
+
+            start_capture(["ffmpeg"])
+        self.assertEqual(popen.call_args.kwargs["stderr"], subprocess.DEVNULL)
+        self.assertFalse((self.root / "loudness").exists())
+
+    def test_meter_keeps_draining_when_the_metric_cannot_be_written(self):
+        from recording import meter
+
+        lines = iter(["lavfi.r128.I=-16.0\n", "lavfi.r128.I=-15.0\n", "lavfi.r128.I=-14.0\n"])
+        with patch("recording.monitor_loudness", side_effect=lambda stream, path: (next(stream), (_ for _ in ()).throw(OSError("read-only")))):
+            meter(lines, self.root / "loudness" / "recording.json")
+        self.assertEqual(list(lines), [])

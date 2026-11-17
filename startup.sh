@@ -42,6 +42,10 @@ LIVEKIT_CHILDREN_FILE=/tmp/livekit-children.pids
 LIVEKIT_PROGRESS=/tmp/livekit-progress.txt
 LIVEKIT_VIDEO_SOCKET=/tmp/alana-program-video.sock
 LIVEKIT_AUDIO_SOCKET=/tmp/alana-program-audio.sock
+# ALANA_PROCESSED_AUDIO=on (default): every encoder applies audio_chain.py's one
+# 48 kHz loudness chain to its own input. off is the kill switch to raw audio.
+ALANA_PROCESSED_AUDIO="${ALANA_PROCESSED_AUDIO:-on}"
+LOUDNESS_DIR="$(dirname "${ALANA_RUNTIME_METRICS_FILE:-/run/alana/runtime-metrics.json}")/loudness"
 
 # shellcheck source=validate-config.sh
 source /usr/local/bin/validate-config.sh
@@ -76,6 +80,7 @@ cleanup() {
     kill "${XVFB_PID:-}" 2>/dev/null || true
     wait 2>/dev/null || true
     rm -f -- "${LIVEKIT_VIDEO_SOCKET}" "${LIVEKIT_AUDIO_SOCKET}"
+    [ "${ALANA_PROCESSED_AUDIO}" = off ] || rm -f "${LOUDNESS_DIR}"/rtmp-*.json "${LOUDNESS_DIR}/livekit.json" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
@@ -145,6 +150,18 @@ stall_watchdog() {
     done
 }
 
+# Sets AUDIO_IN for one encoder: the raw PulseAudio map with the kill switch off,
+# otherwise the shared chain from input 1 to [aout]. Its meter writes ebur128
+# metadata to stderr, which loudness_monitor turns into that output's metric.
+audio_input_args() {
+    if [ "${ALANA_PROCESSED_AUDIO}" = off ]; then
+        AUDIO_IN=(-map 1:a:0); AUDIO_RATE=44100
+    else
+        AUDIO_IN=(-filter_complex "$(python3 /usr/local/bin/audio_chain.py filter 1:a:0 aout)" -map '[aout]'); AUDIO_RATE=48000
+    fi
+}
+loudness_monitor() { python3 /usr/local/bin/alana_metrics.py loudness-monitor "${LOUDNESS_DIR}/$1.json" >/dev/null 2>&1; }
+
 video_args() {
     local selected_encoder=$1 render_node
     case "${selected_encoder}" in
@@ -174,14 +191,21 @@ rtmp_supervisor() (
         fi
         unlink "${progress}" 2>/dev/null || true
         started=$(date +%s)
+        audio_input_args
         # Never retain ffmpeg diagnostics: connection errors can repeat stream keys.
         # -copyts keeps both inputs on their shared wallclock (PulseAudio opens about
         # 2 s after x11grab, so zeroing each input put audio that far ahead);
         # make_zero then shifts every stream by one common offset to start at 0.
-        env PULSE_SERVER="$(get_pulse_socket)" LIBVA_DRIVER_NAME="${VAAPI_DRIVER}" ffmpeg -hide_banner -loglevel quiet -copyts -thread_queue_size 1024 \
-            -f x11grab -draw_mouse "${DRAW_MOUSE}" -video_size "${RESOLUTION}" -framerate "${FPS}" -i "${DISPLAY_NUM}" \
-            -thread_queue_size 1024 -f pulse -i stream_out.monitor -map 0:v:0 -map 1:a:0 "${VIDEO_ARGS[@]}" \
-            -c:a aac -b:a "${AUDIO_BITRATE}" -ar 44100 -ac 2 -avoid_negative_ts make_zero -f flv -progress "${progress}" "${output}" >/dev/null 2>&1 &
+        rtmp_command=(ffmpeg -hide_banner -loglevel quiet -copyts -thread_queue_size 1024
+            -f x11grab -draw_mouse "${DRAW_MOUSE}" -video_size "${RESOLUTION}" -framerate "${FPS}" -i "${DISPLAY_NUM}"
+            -thread_queue_size 1024 -f pulse -i stream_out.monitor -map 0:v:0 "${AUDIO_IN[@]}" "${VIDEO_ARGS[@]}"
+            -c:a aac -b:a "${AUDIO_BITRATE}" -ar "${AUDIO_RATE}" -ac 2 -avoid_negative_ts make_zero -f flv -progress "${progress}" "${output}")
+        if [ "${ALANA_PROCESSED_AUDIO}" = off ]; then
+            env PULSE_SERVER="$(get_pulse_socket)" LIBVA_DRIVER_NAME="${VAAPI_DRIVER}" "${rtmp_command[@]}" >/dev/null 2>&1 &
+        else
+            # -loglevel quiet keeps every diagnostic out; stderr carries only the meter's metadata.
+            env PULSE_SERVER="$(get_pulse_socket)" LIBVA_DRIVER_NAME="${VAAPI_DRIVER}" "${rtmp_command[@]}" >/dev/null 2> >(loudness_monitor "rtmp-${index}") &
+        fi
         rtmp_child=$!; echo "${rtmp_child}" >"${pid_file}"
         stall_watchdog "${rtmp_child}" "${progress}" "rtmp-${index}" & rtmp_watcher=$!
         wait "${rtmp_child}" 2>/dev/null; code=$?; kill "${rtmp_watcher}" 2>/dev/null || true; unlink "${pid_file}" 2>/dev/null || true
@@ -204,13 +228,19 @@ livekit_once() (
     # unlink(1) takes one operand; with more it removes nothing, and a stale socket
     # path makes the next encoder fail with "Address already in use".
     rm -f -- "${LIVEKIT_PROGRESS}" "${LIVEKIT_VIDEO_SOCKET}" "${LIVEKIT_AUDIO_SOCKET}"
+    audio_input_args
     # Same shared-wallclock timestamps as the RTMP encoder.
-    env PULSE_SERVER="$(get_pulse_socket)" ffmpeg -hide_banner -loglevel quiet -copyts -thread_queue_size 1024 \
-        -f x11grab -draw_mouse "${DRAW_MOUSE}" -video_size "${RESOLUTION}" -framerate "${FPS}" -i "${DISPLAY_NUM}" \
-        -thread_queue_size 1024 -f pulse -i stream_out.monitor -map 0:v:0 -an -c:v libx264 -preset "${X264_PRESET}" \
-        -tune zerolatency -profile:v baseline -pix_fmt yuv420p -bf 0 -b:v "${VIDEO_BITRATE}" -g "${GOP_SIZE}" \
-        -bsf:v h264_mp4toannexb -listen 1 -avoid_negative_ts make_zero -f h264 -progress "${LIVEKIT_PROGRESS}" "unix:${LIVEKIT_VIDEO_SOCKET}" \
-        -map 1:a:0 -vn -c:a libopus -ar 48000 -ac 2 -application lowdelay -listen 1 -avoid_negative_ts make_zero -f opus "unix:${LIVEKIT_AUDIO_SOCKET}" >/dev/null 2>&1 &
+    livekit_command=(ffmpeg -hide_banner -loglevel quiet -copyts -thread_queue_size 1024
+        -f x11grab -draw_mouse "${DRAW_MOUSE}" -video_size "${RESOLUTION}" -framerate "${FPS}" -i "${DISPLAY_NUM}"
+        -thread_queue_size 1024 -f pulse -i stream_out.monitor -map 0:v:0 -an -c:v libx264 -preset "${X264_PRESET}"
+        -tune zerolatency -profile:v baseline -pix_fmt yuv420p -bf 0 -b:v "${VIDEO_BITRATE}" -g "${GOP_SIZE}"
+        -bsf:v h264_mp4toannexb -listen 1 -avoid_negative_ts make_zero -f h264 -progress "${LIVEKIT_PROGRESS}" "unix:${LIVEKIT_VIDEO_SOCKET}"
+        "${AUDIO_IN[@]}" -vn -c:a libopus -ar 48000 -ac 2 -application lowdelay -listen 1 -avoid_negative_ts make_zero -f opus "unix:${LIVEKIT_AUDIO_SOCKET}")
+    if [ "${ALANA_PROCESSED_AUDIO}" = off ]; then
+        env PULSE_SERVER="$(get_pulse_socket)" "${livekit_command[@]}" >/dev/null 2>&1 &
+    else
+        env PULSE_SERVER="$(get_pulse_socket)" "${livekit_command[@]}" >/dev/null 2> >(loudness_monitor livekit) &
+    fi
     lk_encoder=$!; echo "${lk_encoder}" >"${LIVEKIT_CHILDREN_FILE}"
     for _ in $(seq 1 300); do [ -S "${LIVEKIT_VIDEO_SOCKET}" ] && break; kill -0 "${lk_encoder}" 2>/dev/null || exit 1; sleep 0.1; done
     [ -S "${LIVEKIT_VIDEO_SOCKET}" ] || exit 1

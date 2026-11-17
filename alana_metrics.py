@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import fcntl
+import io
 import json
 import math
 import os
 import re
 import resource
+import sys
 import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Iterable, Iterator
 
 
 HISTOGRAM_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120)
@@ -57,6 +59,13 @@ RECORDING_STATES = (
 RUNTIME_LEGS = frozenset({"browser", "audio", "rtmp", "livekit"})
 RESTART_REASONS = frozenset({"watchdog", "exit", "stall", "encoder_unavailable"})
 RUNTIME_EVENTS = frozenset({"restart", "stall", "fallback"})
+LOUDNESS_WINDOWS = ("momentary", "short_term", "integrated")
+LOUDNESS_WRITE_INTERVAL_SECONDS = 1.0
+# ebur128 frame metadata keys, as ffmpeg's ametadata filter prints them.
+EBUR128_KEYS = {"lavfi.r128.M": "momentary", "lavfi.r128.S": "short_term", "lavfi.r128.I": "integrated"}
+EBUR128_TRUE_PEAK = "lavfi.r128.true_peak"
+# One loudness file per output: RTMP legs by index, LiveKit and the recorder.
+LOUDNESS_OUTPUT = re.compile(r"(?:rtmp-[1-9][0-9]?|livekit|recording)")
 
 
 def _labels(values: dict[str, str]) -> str:
@@ -117,6 +126,70 @@ def _mapping(value: object) -> dict[object, object]:
     return value if isinstance(value, dict) else {}
 
 
+def _finite(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        number = float(value)
+    except ValueError:
+        return None
+    return number if math.isfinite(number) else None
+
+
+def record_loudness(path: Path, values: dict[str, float], updated: float) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps({"values": values, "updated": updated}), encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def monitor_loudness(
+    lines: Iterable[str],
+    path: Path,
+    interval: float = LOUDNESS_WRITE_INTERVAL_SECONDS,
+    clock=time.monotonic,
+    wallclock=time.time,
+) -> int:
+    """Persist ebur128 frame metadata at most once per interval; return the write count.
+
+    Loudness values are the latest finite reading; true peak is the highest
+    since the output started, in dBTP.
+    """
+    values: dict[str, float] = {}
+    peak: float | None = None
+    written_at: float | None = None
+    unwritten = False
+    writes = 0
+    for line in lines:
+        key, _, text = line.strip().partition("=")
+        value = _finite(text)
+        if value is None:
+            continue
+        if key in EBUR128_KEYS:
+            values[EBUR128_KEYS[key]] = value
+        elif key == EBUR128_TRUE_PEAK and value > 0:
+            peak = max(peak if peak is not None else value, value)
+            values["true_peak"] = round(20 * math.log10(peak), 2)
+        else:
+            continue
+        unwritten = True
+        now = clock()
+        if written_at is None or now - written_at >= interval:
+            record_loudness(path, dict(values), wallclock())
+            written_at, unwritten, writes = now, False, writes + 1
+    if unwritten:
+        record_loudness(path, dict(values), wallclock())
+        writes += 1
+    return writes
+
+
+def _read_loudness_state(path: Path) -> dict[object, object]:
+    try:
+        return _mapping(json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
 def record_runtime_event(path: Path, event: str, leg: str, reason: str = "", backoff: float = 0.0) -> None:
     if event not in RUNTIME_EVENTS or leg not in RUNTIME_LEGS:
         raise ValueError("unknown runtime metric event")
@@ -155,6 +228,8 @@ class Metrics:
     def __init__(self, runtime_path: Path | None = None):
         self.started_at = time.time()
         self.runtime_path = runtime_path or Path(os.environ.get("ALANA_RUNTIME_METRICS_FILE", "/run/alana/runtime-metrics.json"))
+        # Each encoder's meter writes one file in a directory beside the runtime metrics.
+        self.loudness_dir = self.runtime_path.with_name("loudness")
         self.lock = threading.Lock()
         self.counters: dict[tuple[str, tuple[tuple[str, str], ...]], int] = {}
         self.histograms: dict[tuple[str, tuple[tuple[str, str], ...]], dict[str, object]] = {}
@@ -239,6 +314,40 @@ class Metrics:
         lines.append(f'{name}_bucket{_labels({**labels, "le": "+Inf"})} {int(histogram.get("count", 0))}')
         lines.append(f'{name}_sum{_labels(labels)} {float(histogram.get("sum", 0.0)):.9g}')
         lines.append(f'{name}_count{_labels(labels)} {int(histogram.get("count", 0))}')
+
+    def _render_loudness(self, lines: list[str]) -> None:
+        enabled = os.environ.get("ALANA_PROCESSED_AUDIO", "on") != "off"
+        self._gauge(lines, "alana_audio_processing_enabled", "Whether every encoder applies the 48 kHz loudness chain.", int(enabled))
+        if not enabled:
+            return
+        for name, help_text, default in (
+            ("ALANA_LOUDNESS_TARGET", "Configured programme loudness target in LUFS.", "-16"),
+            ("ALANA_TRUE_PEAK_CEILING", "Configured true-peak ceiling in dBTP.", "-1"),
+        ):
+            value = _finite(os.environ.get(name, "") or default)
+            if value is not None:
+                metric = "alana_audio_loudness_target_lufs" if name == "ALANA_LOUDNESS_TARGET" else "alana_audio_true_peak_ceiling_dbtp"
+                self._gauge(lines, metric, help_text, value)
+        try:
+            paths = sorted(self.loudness_dir.glob("*.json"))
+        except OSError:
+            paths = []
+        for path in paths:
+            output = path.stem
+            if not LOUDNESS_OUTPUT.fullmatch(output):
+                continue
+            state = _read_loudness_state(path)
+            values = _mapping(state.get("values"))
+            for window in LOUDNESS_WINDOWS:
+                value = _finite(values.get(window))
+                if value is not None:
+                    self._gauge(lines, "alana_audio_loudness_lufs", "Measured EBU R128 loudness of each output's processed audio by bounded window.", value, {"output": output, "window": window})
+            true_peak = _finite(values.get("true_peak"))
+            if true_peak is not None:
+                self._gauge(lines, "alana_audio_true_peak_dbtp", "Highest true peak of each output's processed audio since it started.", true_peak, {"output": output})
+            updated = _finite(state.get("updated"))
+            if updated is not None:
+                self._gauge(lines, "alana_audio_loudness_updated_timestamp_seconds", "Unix time of each output's latest loudness measurement.", f"{updated:.6f}", {"output": output})
 
     def render(self, snapshot: dict[str, object]) -> str:
         lines: list[str] = []
@@ -416,6 +525,7 @@ class Metrics:
         for leg, histogram in sorted(_mapping(runtime.get("backoff")).items(), key=lambda item: str(item[0])):
             if leg in RUNTIME_LEGS and isinstance(histogram, dict):
                 self._render_histogram(lines, "alana_restart_backoff_seconds", "Configured restart backoff observed by bounded leg.", {"leg": leg}, histogram)
+        self._render_loudness(lines)
         metadata: set[str] = set()
         output: list[str] = []
         for line in lines:
@@ -425,3 +535,13 @@ class Metrics:
                 metadata.add(line)
             output.append(line)
         return "\n".join(output) + "\n"
+
+
+def main(argv: list[str]) -> None:
+    if len(argv) != 2 or argv[0] != "loudness-monitor":
+        raise SystemExit("usage: alana_metrics.py loudness-monitor PATH")
+    monitor_loudness(io.TextIOWrapper(sys.stdin.buffer, encoding="utf-8", errors="replace"), Path(argv[1]))
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

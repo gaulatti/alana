@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import io
 import json
 import math
 import os
@@ -21,6 +22,9 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from fractions import Fraction
 from pathlib import Path
+
+import audio_chain
+from alana_metrics import monitor_loudness
 
 RECORDING_STATES = frozenset(
     {"disabled", "idle", "requested", "active", "finalizing", "complete", "failed"}
@@ -520,12 +524,17 @@ def capture_command(
     if capture_rate <= 0:
         raise ValueError("FPS must be a positive frame rate")
     gop_size = max(1, round(capture_rate * segment_seconds))
+    if audio_chain.enabled():
+        # The same 48 kHz chain the RTMP and LiveKit encoders apply, so the
+        # recording matches what is broadcast.
+        audio_input = ["-filter_complex", audio_chain.configured_graph("1:a:0", "aout"), "-map", "[aout]"]
+    else:
+        audio_input = ["-map", "1:a:0"]
     command.extend(
         [
             "-map",
             "0:v:0",
-            "-map",
-            "1:a:0",
+            *audio_input,
             "-c:v",
             "libx264",
             "-preset",
@@ -572,6 +581,38 @@ def capture_command(
         ]
     )
     return command
+
+
+def loudness_path() -> Path:
+    runtime = Path(os.environ.get("ALANA_RUNTIME_METRICS_FILE", "/run/alana/runtime-metrics.json"))
+    return runtime.with_name("loudness") / "recording.json"
+
+
+def start_capture(command: list[str]) -> subprocess.Popen[bytes]:
+    """Start the capture; with processed audio its stderr feeds the loudness meter."""
+    metered = audio_chain.enabled()
+    process = subprocess.Popen(
+        command,
+        shell=False,
+        env=capture_environment(),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE if metered else subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    if metered:
+        assert process.stderr is not None
+        stream = io.TextIOWrapper(process.stderr, encoding="utf-8", errors="replace")
+        threading.Thread(target=meter, args=(stream, loudness_path()), daemon=True).start()
+    return process
+
+
+def meter(stream: io.TextIOBase, path: Path) -> None:
+    """Feed the loudness metric; if it cannot be written, keep draining so capture never blocks."""
+    try:
+        monitor_loudness(stream, path)
+    except OSError:
+        for _ in stream:
+            pass
 
 
 def capture_environment() -> dict[str, str]:
@@ -832,14 +873,7 @@ def run_supervisor(root: Path, operation_id: str, *, synthetic: bool = False) ->
             segment_seconds,
             synthetic=synthetic,
         )
-        process = subprocess.Popen(
-            command,
-            shell=False,
-            env=capture_environment(),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
+        process = start_capture(command)
         state.update(
             state="active",
             startedAt=state.get("startedAt") or now(),
