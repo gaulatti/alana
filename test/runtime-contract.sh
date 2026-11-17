@@ -70,6 +70,12 @@ if env "${valid_env[@]}" RECORDING_ENABLED=2 bash validate-config.sh >/dev/null 
     exit 1
 fi
 
+env "${valid_env[@]}" ALANA_LIVE_PROFILE=on bash validate-config.sh | grep -q '\[config\] valid'
+if env "${valid_env[@]}" ALANA_LIVE_PROFILE=1 bash validate-config.sh >/dev/null 2>&1; then
+    echo "invalid live-profile setting unexpectedly passed" >&2
+    exit 1
+fi
+
 if env "${valid_env[@]}" RECORDING_QUOTA_BYTES=100 RECORDING_MIN_FREE_BYTES=100 \
     bash validate-config.sh >/dev/null 2>&1; then
     echo "invalid recording disk bounds unexpectedly passed" >&2

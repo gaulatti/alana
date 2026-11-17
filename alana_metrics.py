@@ -20,7 +20,7 @@ from typing import Iterable, Iterator
 HISTOGRAM_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120)
 HTTP_METHODS = frozenset({"GET", "POST", "PUT", "OTHER"})
 HTTP_ROUTES = frozenset(
-    {"metrics", "lifecycle", "filler", "destinations", "recording", "tape", "unknown"}
+    {"metrics", "lifecycle", "filler", "live_profile", "destinations", "recording", "tape", "unknown"}
 )
 STATUS_CLASSES = frozenset({"1xx", "2xx", "3xx", "4xx", "5xx", "unknown"})
 DEPENDENCY_OPERATIONS = frozenset(
@@ -37,6 +37,11 @@ RECONCILE_RESULTS = frozenset({"success", "failure"})
 PREPARATION_RESULTS = frozenset(
     {"success", "failure", "conflict", "unavailable", "duplicate", "reconciled", "not_ready"}
 )
+PROFILE_BINDING_OPERATIONS = frozenset({"prepare", "status", "reconcile", "start"})
+PROFILE_BINDING_RESULTS = frozenset(
+    {"bound", "caller_mismatch", "profile_mismatch", "source_mismatch", "unavailable"}
+)
+LIVE_PROFILE_STATES = ("off", "published", "unqualified")
 DESTINATION_ACTIONS = frozenset({"reload"})
 DESTINATION_RESULTS = frozenset(
     {"success", "failure", "conflict", "duplicate", "active"}
@@ -286,6 +291,13 @@ class Metrics:
             {"result": PREPARATION_RESULTS},
         )
 
+    def observe_profile_binding(self, operation: str, result: str) -> None:
+        self._increment(
+            "alana_filler_profile_bindings_total",
+            {"operation": operation, "result": result},
+            {"operation": PROFILE_BINDING_OPERATIONS, "result": PROFILE_BINDING_RESULTS},
+        )
+
     def observe_destination(self, action: str, result: str) -> None:
         self._increment(
             "alana_destination_operations_total",
@@ -373,6 +385,7 @@ class Metrics:
             "alana_recording_commands_total": "Recording commands by bounded action and result.",
             "alana_reconcile_cycles_total": "Lifecycle reconciliation cycles by result.",
             "alana_filler_preparations_total": "Filler preparation and reconciliation outcomes.",
+            "alana_filler_profile_bindings_total": "Filler readiness checks against the effective live profile, by bounded operation and result.",
             "alana_destination_operations_total": "Destination validation and reload outcomes.",
             "alana_unrecognized_input_total": "Inputs ignored because Alana does not recognize them, by bounded boundary and kind.",
         }
@@ -408,6 +421,16 @@ class Metrics:
             "Whether the configured next-session filler version is acknowledged ready.",
             int(isinstance(pending_filler, dict) and pending_filler.get("ready") is True),
         )
+        live_profile_state = str(snapshot.get("liveProfileState") or "off")
+        live_profile_state = live_profile_state if live_profile_state in LIVE_PROFILE_STATES else "off"
+        for state in LIVE_PROFILE_STATES:
+            self._gauge(
+                lines,
+                "alana_live_profile_state",
+                "Effective live-profile publication as a bounded one-hot gauge.",
+                int(state == live_profile_state),
+                {"state": state},
+            )
         active_destinations = snapshot.get("activeDestinations")
         pending_destinations = snapshot.get("pendingDestinations")
         self._gauge(

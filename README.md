@@ -97,6 +97,12 @@ Programme audio:
 | `ALANA_LOUDNESS_TARGET` | `-16` | Integrated loudness target in LUFS, from `-31` to `-10` |
 | `ALANA_TRUE_PEAK_CEILING` | `-1` | True-peak ceiling in dBTP, from `-6` to `-0.5` |
 
+Television filler binding:
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `ALANA_LIVE_PROFILE` | `off` | `on` publishes the renderer's effective live profile and readies a filler only when Croccante acknowledges exactly that profile; `off` keeps every filler path as before |
+
 ### Programme audio
 
 `audio_chain.py` defines the chain once; `startup.sh` and `recording.py` both
@@ -138,6 +144,7 @@ monotonically increasing `X-Command-Sequence`:
 | `PUT` | `/v1/programs/{programId}/destinations/{version}` | While stopped, validate/reload an exact destination selection through Croccante |
 | `PUT` | `/v1/programs/{programId}/fillers/{version}` | Idempotently prepare the next-session television filler in Croccante |
 | `GET` | `/v1/programs/{programId}/fillers/{version}` | Reconcile and report Croccante's readiness for one version |
+| `GET` | `/v1/programs/{programId}/live-profile` | The renderer's effective live profile and its checksum (`ALANA_LIVE_PROFILE=on` only; otherwise 404) |
 | `GET` | `/v1/programs/{programId}/recording` | Current bounded recording, disk, and finalization state |
 | `POST` | `/v1/programs/{programId}/recording/start` | Start an independent recording of the already-ready composed program |
 | `POST` | `/v1/programs/{programId}/recording/stop` | Stop capture, verify every segment, and remux a final MP4 |
@@ -162,7 +169,7 @@ each). Values are never logged, forwarded, or persisted.
 
 | Boundary | What is ignored | `kind` |
 | --- | --- | --- |
-| `filler_profile` | Extra fields in Croccante's prepared profile; the nine known fields must still be present as integers or strings | `unknown_field` |
+| `filler_profile` | Extra fields in Croccante's prepared profile, and (with `ALANA_LIVE_PROFILE=on`) in the requested profile; the nine known fields must still be present and valid | `unknown_field` |
 | `filler_status` | A Croccante filler status other than `ready`, `failed`, `unprepared`, or `preparing`; Alana reports it as `status: "unknown"`, `ready: false` (not ready, not failed) | `unknown_value` |
 | `destinations_start` | Extra fields on the Start selection or on a destination item | `unknown_field` |
 | `destinations_reload` | Extra fields on the reload body or on a destination item | `unknown_field` |
@@ -284,6 +291,74 @@ remains visible and retryable, and restart reconciliation checks Croccante's
 durable prepared state without needing the signed URL again. Extra fields in
 Croccante's prepared profile are ignored and dropped; an unrecognized filler
 status is reported as `unknown` and not ready.
+
+### Filler bound to the effective live profile
+
+With `ALANA_LIVE_PROFILE=on` (off by default), Alana publishes the profile its
+own RTMP encoder runs with, and a filler becomes ready only against it. The
+machine contract is pinned on gaulatti/alcantara#126; Alcantara reads this
+profile and sends it back unchanged in the `PUT`.
+
+```json
+{
+  "contractVersion": 1,
+  "programId": "main",
+  "profile": {
+    "width": 1920, "height": 1080, "fps": 30, "videoBitrate": "6000k",
+    "audioRate": 48000, "audioChannels": 2, "audioBitrate": "128k",
+    "gop": 60, "loopSeconds": 10
+  },
+  "checksum": "<64 lowercase hex>"
+}
+```
+
+The values come from the same settings `startup.sh` hands to the RTMP encoder,
+with its defaults: `RESOLUTION`, `FPS`, `VIDEO_BITRATE`, `GOP_SIZE`,
+`AUDIO_BITRATE`, stereo AAC, and 48 kHz with processed audio on or 44.1 kHz with
+`ALANA_PROCESSED_AUDIO=off`. `loopSeconds` is not a renderer setting; it is
+fixed at Croccante's own default, 10. `checksum` is the SHA-256 of the profile's
+canonical JSON (sorted keys, no whitespace, bitrates as strings). Tests run the
+real `startup.sh` against stub encoders and read the profile back from the RTMP
+encoder's arguments.
+
+Only qualified configurations are published: the `libx264` encoder (its
+`-sc_threshold 0` fixes the GOP), an integer `FPS`, a `WIDTHxHEIGHT` resolution
+and `k` bitrates. The GPU encoders (`GPU_TYPE=NVIDIA`/`INTEL`, `h264_nvenc`,
+`h264_vaapi`) are not qualified yet: that needs a measurement on the real
+hardware. An unqualified or unknown mode answers 404, exactly like `off`, and
+`alana_live_profile_state` reports `unqualified`. `VIDEO_MAXRATE` and
+`VIDEO_BUFSIZE` are outside the pinned nine-key contract.
+
+With the setting on:
+
+- A `PUT` whose nine profile values differ from the live profile is refused
+  with 409 `profile-mismatch` before any state or Croccante call; with no
+  qualified live profile it is refused with 503 `invalid-profile`. The previous
+  pending and active versions are untouched. Extra profile fields are ignored
+  and counted.
+- A version is `ready: true`, `status: "ready"` only when Croccante acknowledged
+  the complete profile, its checksum equals the live checksum, and `sourceId`
+  and `sourceSha256` equal the request. The `PUT`, `GET .../fillers/{version}`
+  and the lifecycle `activeFiller`/`pendingFiller` then carry `profileChecksum`.
+  Anything else is `ready: false` with `reason: "profile-mismatch"` (profile) or
+  `error: "unexpected-state"` (source), and the `PUT`/`GET` answer 409.
+- Alana keeps the request's source id and checksum privately (never the
+  download URL) so restart reconciliation can bind the acknowledgement. A
+  version Alana holds no request for never becomes ready from a `GET`; a version
+  prepared while the setting was off becomes ready once its identical `PUT` is
+  replayed.
+- Start re-checks the pending version against the live profile and fails
+  closed with `filler-not-ready` when the configuration changed after
+  preparation. The active version is never rewritten.
+
+Compatibility: Croccante's existing prepare and status acknowledgement already
+returns the nine profile values, so no Croccante change is needed; a Croccante
+that omits them leaves every filler unready (fail closed). An Alcantara without
+gaulatti/alcantara#126 never reads the profile, and with the setting off this
+Alana answers 404, which that Alcantara reports as "television live profile
+unavailable". Rollback: set `ALANA_LIVE_PROFILE=off` and restart; responses
+lose `profileChecksum`, and Alcantara's Start binding returns to today's
+behaviour.
 
 Start fails closed until a pending version is ready. Alana passes that exact
 version to Croccante with `X-Filler-Version` and reports Running only when
@@ -461,6 +536,8 @@ RTMP legs are aggregated into configured, healthy, and progressing counts.
 | `alana_lifecycle_commands_total` | Start/Stop command outcomes | `action`, `result` |
 | `alana_reconcile_cycles_total` | Reconciliation success/failure | `result` |
 | `alana_filler_preparations_total` | Preparation, duplicate, conflict, retry, and reconciliation outcomes | `result` |
+| `alana_filler_profile_bindings_total` | Filler readiness checks against the live profile (`ALANA_LIVE_PROFILE=on`) | `operation` (`prepare`, `status`, `reconcile`, `start`), `result` (`bound`, `caller_mismatch`, `profile_mismatch`, `source_mismatch`, `unavailable`) |
+| `alana_live_profile_state` | One-hot live-profile publication | `state` (`off`, `published`, `unqualified`) |
 | `alana_destination_operations_total` | Destination reload validation outcomes | `action`, `result` |
 | `alana_recording_commands_total` | Recording Start/Stop outcomes | `action`, `result` |
 | `alana_unrecognized_input_total` | Inputs ignored because Alana does not recognize them | `boundary` (`filler_profile`, `filler_status`, `destinations_start`, `destinations_reload`, `command_body`), `kind` (`unknown_field`, `unknown_value`, `unexpected_body`) |

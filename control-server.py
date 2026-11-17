@@ -15,11 +15,12 @@ import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urlsplit
 from urllib.request import Request, urlopen
 
+import audio_chain
 from alana_metrics import Metrics
 from recording import RecordingController
 
@@ -67,6 +68,109 @@ FILLER_FAILURE_REASONS = frozenset(
 UNRECOGNIZED_LOG_KEYS = 8
 UNRECOGNIZED_LOG_KEY_LENGTH = 40
 FILLER_STATUSES = frozenset({"failed", "unprepared", "preparing"})
+
+# The effective live profile (pinned contract on gaulatti/alcantara#126).
+LIVE_PROFILE_PATH = f"/v1/programs/{quote(PROGRAM_ID, safe='')}/live-profile"
+LIVE_PROFILE_CONTRACT_VERSION = 1
+# startup.sh's own defaults for the settings its RTMP encoder reads; an empty
+# value means the default there too (``${NAME:-default}``).
+STARTUP_DEFAULTS = {
+    "RESOLUTION": "1920x1080",
+    "FPS": "30",
+    "VIDEO_BITRATE": "6000k",
+    "GOP_SIZE": "60",
+    "AUDIO_BITRATE": "128k",
+    "VIDEO_ENCODER": "libx264",
+}
+# Only the software encoder is qualified: its arguments fix the GOP exactly
+# (-sc_threshold 0). The GPU encoders need a hardware qualification first.
+QUALIFIED_ENCODERS = frozenset({"libx264"})
+# startup.sh always encodes stereo AAC (-ac 2).
+LIVE_AUDIO_CHANNELS = 2
+# Alana has no renderer setting for the filler loop; this is Croccante's own default.
+FILLER_LOOP_SECONDS = 10
+LIVE_BITRATE = re.compile(r"^[1-9][0-9]{0,6}k$")
+LIVE_INTEGER = re.compile(r"^[1-9][0-9]{0,5}$")
+LIVE_RESOLUTION = re.compile(r"^([1-9][0-9]{0,5})x([1-9][0-9]{0,5})$")
+# The nine keys Alana accepts and acknowledges for a filler profile.
+LIVE_PROFILE_KEYS = frozenset(
+    {"width", "height", "fps", "videoBitrate", "audioRate", "audioChannels", "audioBitrate", "gop", "loopSeconds"}
+)
+
+
+def profile_checksum(profile: dict[str, object]) -> str:
+    """SHA-256 of the canonical JSON: sorted keys, no whitespace."""
+    return hashlib.sha256(
+        json.dumps(profile, separators=(",", ":"), sort_keys=True).encode()
+    ).hexdigest()
+
+
+def live_profile_enabled(environ: Mapping[str, str] = os.environ) -> bool:
+    """``ALANA_LIVE_PROFILE``: off by default; on publishes and binds the live profile."""
+    value = environ.get("ALANA_LIVE_PROFILE", "") or "off"
+    if value not in ("on", "off"):
+        raise ValueError("ALANA_LIVE_PROFILE must be on or off")
+    return value == "on"
+
+
+def effective_live_profile(
+    environ: Mapping[str, str] = os.environ,
+) -> dict[str, object] | None:
+    """The RTMP output profile startup.sh builds from these same settings.
+
+    None when the configuration is not a qualified one: a GPU or unknown
+    encoder, a non-integer frame rate, or a value the contract cannot carry
+    exactly. Alana never publishes a profile it cannot vouch for."""
+
+    def setting(name: str) -> str:
+        return environ.get(name, "") or STARTUP_DEFAULTS[name]
+
+    gpu = environ.get("GPU_TYPE", "")
+    encoder = (
+        "h264_nvenc" if gpu == "NVIDIA" else "h264_vaapi" if gpu == "INTEL" else setting("VIDEO_ENCODER")
+    )
+    resolution = LIVE_RESOLUTION.fullmatch(setting("RESOLUTION"))
+    try:
+        processed = audio_chain.enabled(environ)
+    except ValueError:
+        return None
+    if (
+        encoder not in QUALIFIED_ENCODERS
+        or resolution is None
+        or not LIVE_INTEGER.fullmatch(setting("FPS"))
+        or not LIVE_INTEGER.fullmatch(setting("GOP_SIZE"))
+        or not LIVE_BITRATE.fullmatch(setting("VIDEO_BITRATE"))
+        or not LIVE_BITRATE.fullmatch(setting("AUDIO_BITRATE"))
+    ):
+        return None
+    return {
+        "width": int(resolution.group(1)),
+        "height": int(resolution.group(2)),
+        "fps": int(setting("FPS")),
+        "videoBitrate": setting("VIDEO_BITRATE"),
+        # startup.sh's audio_input_args: the chain resamples to 48 kHz; off keeps 44.1 kHz.
+        "audioRate": audio_chain.SAMPLE_RATE if processed else 44100,
+        "audioChannels": LIVE_AUDIO_CHANNELS,
+        "audioBitrate": setting("AUDIO_BITRATE"),
+        "gop": int(setting("GOP_SIZE")),
+        "loopSeconds": FILLER_LOOP_SECONDS,
+    }
+
+
+def configured_live_profile(
+    environ: Mapping[str, str] = os.environ,
+) -> dict[str, object] | None:
+    """The live-profile document, or None when the opt-in setting is off.
+
+    With the setting on and an unqualified configuration, ``profile`` is None:
+    nothing is published and no filler can become ready."""
+    if not live_profile_enabled(environ):
+        return None
+    profile = effective_live_profile(environ)
+    return {
+        "profile": profile,
+        "checksum": profile_checksum(profile) if profile is not None else None,
+    }
 
 
 def note_unrecognized(boundary: str, kind: str, names: Iterable[object] = ()) -> None:
@@ -694,17 +798,7 @@ class CroccanteClient:
         source_sha = source.get("sourceSha256")
         artifact_sha = source.get("artifactSha256")
         profile = source.get("profile")
-        profile_keys = {
-            "width",
-            "height",
-            "fps",
-            "videoBitrate",
-            "audioRate",
-            "audioChannels",
-            "audioBitrate",
-            "gop",
-            "loopSeconds",
-        }
+        profile_keys = set(LIVE_PROFILE_KEYS)
         safe_profile = (
             {key: profile[key] for key in profile_keys}
             if isinstance(profile, dict)
@@ -777,10 +871,13 @@ class LifecycleManager:
         monotonic: Callable[[], float] = time.monotonic,
         ready_timeout: int = PIPELINE_READY_TIMEOUT,
         start_monitor: bool = True,
+        live_profile: dict[str, object] | None = None,
     ):
         self.store = store
         self.pipeline = pipeline
         self.croccante = croccante
+        # None while ALANA_LIVE_PROFILE is off: every filler path is exactly as before.
+        self.live_profile = live_profile
         self.sleep = sleep
         self.monotonic = monotonic
         self.ready_timeout = ready_timeout
@@ -825,7 +922,9 @@ class LifecycleManager:
                 ),
             }
         public["activeFiller"] = self._public_filler(self.state.get("activeFiller"))
-        public["pendingFiller"] = self._public_filler(self.state.get("pendingFiller"))
+        public["pendingFiller"] = self._public_filler(
+            self._bind(self.state.get("pendingFiller"))[0]
+        )
         public["activeDestinations"] = self._public_destinations(
             self.state.get("activeDestinations")
         )
@@ -834,8 +933,7 @@ class LifecycleManager:
         )
         return {**public, **self.pipeline.status()}
 
-    @staticmethod
-    def _public_filler(value: object) -> dict[str, object] | None:
+    def _public_filler(self, value: object) -> dict[str, object] | None:
         if not isinstance(value, dict):
             return None
         allowed = {
@@ -849,8 +947,63 @@ class LifecycleManager:
             "preparedAt",
             "reason",
             "error",
+            *(("profileChecksum",) if self.live_profile is not None else ()),
         }
         return {key: item for key, item in value.items() if key in allowed}
+
+    def live_profile_state(self) -> str:
+        if self.live_profile is None:
+            return "off"
+        return "unqualified" if self.live_profile.get("profile") is None else "published"
+
+    @staticmethod
+    def _internal(existing: dict[str, object]) -> dict[str, object]:
+        """Private bookkeeping a refreshed filler record keeps: never public."""
+        return {
+            key: existing[key]
+            for key in ("configurationDigest", "requestedSource")
+            if existing.get(key)
+        }
+
+    def _bind(self, filler: object) -> tuple[object, str]:
+        """Readiness under the live-profile contract (gaulatti/alcantara#126).
+
+        Ready only when Croccante acknowledged the complete profile, its
+        checksum equals the effective live profile's, and the source identity
+        equals the request. Anything else is a bounded failure. With the
+        setting off, or a filler that is not ready, nothing changes."""
+        if self.live_profile is None or not isinstance(filler, dict) or filler.get("ready") is not True:
+            return filler, "not_bound"
+        live = self.live_profile.get("checksum")
+        profile = filler.get("profile")
+        acknowledged = (
+            profile_checksum({key: profile.get(key) for key in LIVE_PROFILE_KEYS})
+            if isinstance(profile, dict)
+            else None
+        )
+        requested = filler.get("requestedSource")
+        if live is None:
+            result = "unavailable"
+        elif acknowledged != live:
+            result = "profile_mismatch"
+        elif not (
+            isinstance(requested, list)
+            and requested == [filler.get("sourceId"), filler.get("sourceSha256")]
+        ):
+            result = "source_mismatch"
+        else:
+            return {**filler, "profileChecksum": acknowledged}, "bound"
+        return {
+            "version": filler.get("version"),
+            "status": "failed",
+            "ready": False,
+            **(
+                {"error": "unexpected-state"}
+                if result == "source_mismatch"
+                else {"reason": "profile-mismatch"}
+            ),
+            **self._internal(filler),
+        }, result
 
     @staticmethod
     def _public_destinations(value: object) -> dict[str, object] | None:
@@ -945,6 +1098,13 @@ class LifecycleManager:
         payload: dict[str, object],
     ) -> tuple[int, dict[str, object]]:
         digest = self._filler_digest(payload)
+        bound: dict[str, object] = {}
+        if self.live_profile is not None:
+            refusal = self._refuse_unbindable(version, payload)
+            if refusal is not None:
+                return refusal
+            source = payload.get("source") if isinstance(payload.get("source"), dict) else {}
+            bound = {"requestedSource": [source.get("id"), source.get("sha256")]}
         with self.preparation_lock:
             with self.lock:
                 for slot in ("activeFiller", "pendingFiller"):
@@ -960,13 +1120,25 @@ class LifecycleManager:
                             "reason": "version-conflict",
                         }
                     if existing.get("ready") is True:
-                        METRICS.observe_preparation("duplicate")
-                        return 200, {**(self._public_filler(existing) or {}), "duplicate": True}
+                        if self.live_profile is not None:
+                            existing, binding = self._bind({**existing, **bound})
+                            METRICS.observe_profile_binding("prepare", binding)
+                            if slot == "pendingFiller":
+                                self.state[slot] = existing
+                                self._save()
+                        if existing.get("ready") is True:
+                            METRICS.observe_preparation("duplicate")
+                            return 200, {**(self._public_filler(existing) or {}), "duplicate": True}
+                        if slot == "activeFiller":
+                            # The active session's version is immutable; a replacement needs a new version.
+                            METRICS.observe_preparation("conflict")
+                            return 409, self._public_filler(existing) or {}
                 self.state["pendingFiller"] = {
                     "version": version,
                     "status": "preparing",
                     "ready": False,
                     "configurationDigest": digest,
+                    **bound,
                 }
                 self._save()
 
@@ -976,7 +1148,14 @@ class LifecycleManager:
                     **result,
                     "version": version,
                     "configurationDigest": digest,
+                    **bound,
                 }
+                if self.live_profile is not None:
+                    filler, binding = self._bind(filler)
+                    if binding != "not_bound":
+                        METRICS.observe_profile_binding("prepare", binding)
+                    if status < 300 and filler.get("ready") is not True:
+                        status = 409
                 self.state["pendingFiller"] = filler
                 self._save()
                 if status < 300 and filler.get("ready") is True:
@@ -990,22 +1169,51 @@ class LifecycleManager:
                 METRICS.observe_preparation(outcome)
                 return status, self._public_filler(filler) or {}
 
+    def _refuse_unbindable(
+        self, version: str, payload: dict[str, object]
+    ) -> tuple[int, dict[str, object]] | None:
+        """Refuse, before any state or downstream change, a preparation that can
+        never bind: no qualified live profile, or a caller profile that differs."""
+        live = self.live_profile.get("profile") if self.live_profile else None
+        requested = payload.get("profile")
+        if live is None:
+            METRICS.observe_profile_binding("prepare", "unavailable")
+            METRICS.observe_preparation("failure")
+            return 503, {"version": version, "status": "failed", "ready": False, "reason": "invalid-profile"}
+        if isinstance(requested, dict):
+            ignore_unknown_keys(requested, set(LIVE_PROFILE_KEYS), "filler_profile")
+        if not isinstance(requested, dict) or profile_checksum(
+            {key: requested.get(key) for key in LIVE_PROFILE_KEYS}
+        ) != self.live_profile.get("checksum"):
+            METRICS.observe_profile_binding("prepare", "caller_mismatch")
+            METRICS.observe_preparation("conflict")
+            return 409, {"version": version, "status": "failed", "ready": False, "reason": "profile-mismatch"}
+        return None
+
     def filler_status(self, version: str) -> tuple[int, dict[str, object]]:
         status, result = self.croccante.filler_status(version)
+        public = result
         with self.lock:
             for slot in ("activeFiller", "pendingFiller"):
                 existing = self.state.get(slot)
                 if isinstance(existing, dict) and existing.get("version") == version:
-                    self.state[slot] = {
-                        **result,
-                        **(
-                            {"configurationDigest": existing["configurationDigest"]}
-                            if existing.get("configurationDigest")
-                            else {}
-                        ),
-                    }
+                    refreshed = {**result, **self._internal(existing)}
+                    if self.live_profile is not None:
+                        refreshed, binding = self._bind(refreshed)
+                        if binding != "not_bound":
+                            METRICS.observe_profile_binding("status", binding)
+                        public = refreshed
+                    self.state[slot] = refreshed
             self._save()
-        return status, self._public_filler(result) or {}
+        if self.live_profile is not None:
+            if public is result:
+                # A version Alana holds no request for can never prove its source.
+                public, binding = self._bind(result)
+                if binding != "not_bound":
+                    METRICS.observe_profile_binding("status", binding)
+            if status < 300 and public.get("ready") is not True:
+                status = 409
+        return status, self._public_filler(public) or {}
 
     def _set_transition(self, requested: str, actual: str, transition: str) -> None:
         timestamps = dict(self.state.get("timestamps") or {})
@@ -1193,6 +1401,11 @@ class LifecycleManager:
             )
 
         pending_filler = self.state.get("pendingFiller")
+        if self.live_profile is not None:
+            # A stale or changed live profile fails closed here, before any side effect.
+            pending_filler, binding = self._bind(pending_filler)
+            if binding != "not_bound":
+                METRICS.observe_profile_binding("start", binding)
         if not isinstance(pending_filler, dict) or pending_filler.get("ready") is not True:
             return self._finish_command(
                 key, "start", sequence, "filler-not-ready", 409, destination
@@ -1317,16 +1530,14 @@ class LifecycleManager:
                 version = str(pending_filler.get("version") or "")
                 if FILLER_IDENTIFIER.fullmatch(version):
                     status, result = self.croccante.filler_status(version)
-                    self.state["pendingFiller"] = {
-                        **result,
-                        **(
-                            {"configurationDigest": pending_filler["configurationDigest"]}
-                            if pending_filler.get("configurationDigest")
-                            else {}
-                        ),
-                    }
+                    refreshed = {**result, **self._internal(pending_filler)}
+                    if self.live_profile is not None:
+                        refreshed, binding = self._bind(refreshed)
+                        if binding != "not_bound":
+                            METRICS.observe_profile_binding("reconcile", binding)
+                    self.state["pendingFiller"] = refreshed
                     METRICS.observe_preparation(
-                        "reconciled" if status < 300 and result.get("ready") is True else "not_ready"
+                        "reconciled" if status < 300 and refreshed.get("ready") is True else "not_ready"
                     )
                     self._save()
             requested = self.state.get("requestedState")
@@ -1665,6 +1876,8 @@ class Handler(BaseHTTPRequestHandler):
             if "/destinations/" in path
             else "filler"
             if "/fillers/" in path
+            else "live_profile"
+            if path.endswith("/live-profile")
             else "lifecycle"
             if path.startswith("/v1/programs/")
             else "unknown"
@@ -1774,13 +1987,17 @@ class Handler(BaseHTTPRequestHandler):
         started = time.monotonic()
         self.response_status = 500
         path = urlsplit(self.path).path
-        route = "metrics" if path == METRICS_PATH else "tape" if path.startswith(TAPE_PATH) else "recording" if "/recording" in path else "destinations" if "/destinations/" in path else "filler" if "/fillers/" in path else "lifecycle" if path.startswith("/v1/programs/") else "unknown"
+        route = "metrics" if path == METRICS_PATH else "tape" if path.startswith(TAPE_PATH) else "recording" if "/recording" in path else "destinations" if "/destinations/" in path else "filler" if "/fillers/" in path else "live_profile" if path.endswith("/live-profile") else "lifecycle" if path.startswith("/v1/programs/") else "unknown"
         try:
             if path == METRICS_PATH:
                 if self.authorize():
                     self.send_metrics(
                         METRICS.render(
-                            {**manager().view(), "recording": recorder().status()}
+                            {
+                                **manager().view(),
+                                "recording": recorder().status(),
+                                "liveProfileState": manager().live_profile_state(),
+                            }
                         )
                     )
                 return
@@ -1802,6 +2019,22 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 status, payload = manager().filler_status(version)
                 self.send_json(status, payload)
+                return
+            if path == LIVE_PROFILE_PATH:
+                document = manager().live_profile
+                if document is None or document.get("profile") is None:
+                    # Off, or a configuration Alana cannot vouch for: absent, never guessed.
+                    self.send_json(404, {"error": "not found"})
+                    return
+                self.send_json(
+                    200,
+                    {
+                        "contractVersion": LIVE_PROFILE_CONTRACT_VERSION,
+                        "programId": PROGRAM_ID,
+                        "profile": document["profile"],
+                        "checksum": document["checksum"],
+                    },
+                )
                 return
             if path != PROGRAM_PATH:
                 self.send_json(404, {"error": "not found"})
@@ -1990,7 +2223,16 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> None:
     global MANAGER, RECORDER, TAPE
     subprocess.run(["/usr/local/bin/validate-config.sh"], check=True)
-    MANAGER = LifecycleManager(StateStore(), SubprocessPipeline(), CroccanteClient())
+    MANAGER = LifecycleManager(
+        StateStore(),
+        SubprocessPipeline(),
+        CroccanteClient(),
+        live_profile=configured_live_profile(),
+    )
+    print(
+        f"[control] live profile {MANAGER.live_profile_state()}",
+        flush=True,
+    )
     RECORDER = RecordingController(
         STATE_DIR / "recordings",
         enabled=os.environ.get("RECORDING_ENABLED", "0") == "1",
