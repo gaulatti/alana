@@ -156,10 +156,12 @@ class LiveKitStallRecoveryTests(unittest.TestCase):
             ["bash", str(STARTUP)], env=self.environment,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
         )
-        first = self.wait_for(
-            lambda: next((pid for pid, leg in self.started() if leg == "livekit"), None),
-            message="the LiveKit encoder never started",
+        # Both encoders start independently; a slow runner may start either first.
+        self.wait_for(
+            lambda: {leg for _, leg in self.started()} >= {"rtmp", "livekit"},
+            message="the RTMP and LiveKit encoders did not both start",
         )
+        first = next(pid for pid, leg in self.started() if leg == "livekit")
         rtmp = [pid for pid, leg in self.started() if leg == "rtmp"]
         self.assertEqual(len(rtmp), 1)
 
