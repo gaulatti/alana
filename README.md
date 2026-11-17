@@ -173,6 +173,10 @@ within its bounded budget. A control-process or container restart resumes a
 persisted Requested/Active operation. An explicit Stop changes state to
 Finalizing, verifies every segment checksum, remuxes without transcoding, probes
 the MP4, and reports Complete only with its final checksum and media metadata.
+The remux places each segment where the previous segment's video ends, not at
+its container duration, which also counts the audio frame that overhangs the
+cut; concatenating by container duration made audio drift about 1.5 ms per
+second ahead of video over the recording.
 
 Free space and all retained bytes below the recording root, including state and
 idempotency command records, are checked before Start and while recording.

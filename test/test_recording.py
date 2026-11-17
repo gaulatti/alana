@@ -358,3 +358,118 @@ class RecordingContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg tools are required")
+class RecordingDriftTests(unittest.TestCase):
+    """The finalized program keeps audio and video in sync for its whole length (#32)."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def capture_flash_and_beep(self, seconds: int) -> tuple["RecordingStore", dict]:
+        """Run the recorder's own encode and segment arguments on an in-sync flash and beep."""
+        from recording import RecordingStore, capture_command, harvest_segments, now
+
+        store = RecordingStore(self.root)
+        state = {
+            "enabled": True, "state": "active", "operationId": "0123456789abcdef", "requestedAt": now(), "startedAt": now(),
+            "segmentCount": 0, "bytes": 0, "durationSeconds": 0.0, "droppedFrames": 0, "errors": 0, "restarts": 0,
+            "finalizationState": "not-requested",
+        }
+        operation = store.operation_dir("0123456789abcdef")
+        operation.mkdir(parents=True, exist_ok=True)
+        store.save(state)
+        with patch.dict(os.environ, {"RECORDING_TEST_RESOLUTION": "160x90", "RECORDING_X264_PRESET": "ultrafast"}, clear=False):
+            command = capture_command(operation, 0, 5, synthetic=True, duration=seconds)
+        beep = "if(between(mod(t\\,10)\\,5\\,5.3)\\,0.1*sin(2*PI*1000*t)\\,0)"
+        inputs = [index for index, value in enumerate(command) if value == "-i"]
+        command[inputs[0] + 1] = "color=c=black:s=160x90:r=30,drawbox=c=white:t=fill:enable='between(mod(t,10),5,5.3)'"
+        command[inputs[1] + 1] = f"aevalsrc={beep}|{beep}:s=48000"
+        command = [value for value in command if value != "-re"]  # the inputs are synthetic; no need for real time
+        subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=seconds + 60)
+        harvest_segments(store, state, include_latest=True)
+        return store, state
+
+    @staticmethod
+    def offsets(path: Path) -> list[float]:
+        """Audio minus video onset per flash/beep event, in the program's own timeline (ms)."""
+        stats = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-i", str(path), "-map", "0:v:0", "-vf", "signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=-", "-f", "null", "-"],
+            capture_output=True, text=True, check=True,
+        ).stdout
+        flashes, moment, last = [], 0.0, -10.0
+        for line in stats.splitlines():
+            if line.startswith("frame:"):
+                moment = float(line.split("pts_time:")[1])
+            elif "YAVG" in line and float(line.split("=")[1]) > 128:
+                if moment - last > 1:
+                    flashes.append(moment)
+                last = moment
+        start = float(json.loads(subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=start_time", "-of", "json", str(path)],
+            capture_output=True, text=True, check=True,
+        ).stdout)["streams"][0]["start_time"])
+        pcm = path.with_suffix(".wav")
+        subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(path), "-ac", "1", "-c:a", "pcm_s16le", str(pcm)], check=True)
+        import array
+        import wave
+
+        with wave.open(str(pcm)) as handle:
+            rate, samples = handle.getframerate(), array.array("h", handle.readframes(handle.getnframes()))
+        beeps, last = [], -10.0
+        for index, sample in enumerate(samples):
+            if abs(sample) > 1500:
+                moment = start + index / rate
+                if moment - last > 1:
+                    beeps.append(moment)
+                last = moment
+        return [(beep - min(flashes, key=lambda flash: abs(flash - beep))) * 1000 for beep in beeps]
+
+    def test_finalized_program_does_not_drift_over_a_minute(self):
+        from recording import finalize_recording
+
+        store, state = self.capture_flash_and_beep(62)
+        self.assertTrue(finalize_recording(store, state))
+        offsets = self.offsets(store.operation_dir("0123456789abcdef") / "program.mp4")
+        self.assertEqual(len(offsets), 6, offsets)
+        self.assertLessEqual(max(offsets) - min(offsets), 10, f"drift across the program: {offsets}")
+        self.assertLessEqual(max(abs(offset) for offset in offsets), 40, offsets)
+
+    def test_unreadable_segment_timing_fails_finalization_closed(self):
+        from recording import finalize_recording
+
+        store, state = self.capture_flash_and_beep(6)
+        real_run = subprocess.run
+
+        def unreadable(command, *args, **kwargs):
+            if "packet=pts_time,duration_time" in command:
+                return subprocess.CompletedProcess(command, 0, stdout=json.dumps({"packets": [{"pts_time": "x"}]}), stderr="")
+            return real_run(command, *args, **kwargs)
+
+        with patch("recording.subprocess.run", side_effect=unreadable):
+            self.assertFalse(finalize_recording(store, state))
+        self.assertFalse((store.operation_dir("0123456789abcdef") / "program.mp4").exists())
+        self.assertEqual(store.load(enabled=True)["finalizationState"], "failed")
+
+
+class SegmentVideoSpanTests(unittest.TestCase):
+    def probe(self, payload):
+        from recording import segment_video_span
+
+        answer = subprocess.CompletedProcess([], 0, stdout=json.dumps(payload), stderr="")
+        with patch("recording.subprocess.run", return_value=answer):
+            return segment_video_span(Path("segment-000000.mkv"))
+
+    def test_span_runs_from_the_first_frame_to_the_end_of_the_last(self):
+        packets = [{"pts_time": "0.100000", "duration_time": "0.033333"}, {"pts_time": "0.000000", "duration_time": "0.033333"}]
+        self.assertAlmostEqual(self.probe({"packets": packets}), 0.133333, places=6)
+
+    def test_a_segment_without_usable_video_timing_is_refused(self):
+        for payload in ({"packets": []}, {}, ["packets"], {"packets": [{"pts_time": "0", "duration_time": "0"}]}, {"packets": [{"pts_time": "nan", "duration_time": "1"}]}):
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                self.probe(payload)

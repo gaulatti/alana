@@ -7,6 +7,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -623,6 +624,47 @@ def terminate_process(process: subprocess.Popen[bytes], timeout: int = 15) -> No
         process.wait(timeout=5)
 
 
+def segment_video_span(path: Path) -> float:
+    """Seconds from a segment's first video frame to the end of its last one.
+
+    Segments are cut on video keyframes, so consecutive spans tile the
+    recording exactly. The container duration also counts the AAC frame that
+    overhangs each cut (up to 21 ms); concatenating by it delayed the video of
+    every later segment, so audio drifted ahead by about 1.5 ms per second.
+    """
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "packet=pts_time,duration_time",
+            "-of",
+            "json",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    payload = json.loads(result.stdout)
+    packets = payload.get("packets") if isinstance(payload, dict) else None
+    if not isinstance(packets, list) or not packets:
+        raise ValueError("segment has no video")
+    try:
+        starts = [float(packet["pts_time"]) for packet in packets]
+        last = max(range(len(packets)), key=lambda index: starts[index])
+        span = starts[last] + float(packets[last]["duration_time"]) - min(starts)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("segment video timing is unreadable") from exc
+    if not math.isfinite(span) or span <= 0:
+        raise ValueError("segment video span is invalid")
+    return span
+
+
 def finalize_recording(store: RecordingStore, state: dict[str, object]) -> bool:
     state["state"] = "finalizing"
     state["finalizationState"] = "pending"
@@ -638,7 +680,8 @@ def finalize_recording(store: RecordingStore, state: dict[str, object]) -> bool:
                 segment = operation_dir / str(record["file"])
                 if sha256_file(segment) != record.get("sha256"):
                     raise ValueError("segment checksum mismatch")
-                output.write(f"file '{segment.name}'\n")
+                # Each segment starts where the previous one's video ended.
+                output.write(f"file '{segment.name}'\nduration {segment_video_span(segment):.6f}\n")
             output.flush()
             os.fsync(output.fileno())
         final_path = operation_dir / "program.mp4"
