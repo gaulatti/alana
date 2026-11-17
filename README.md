@@ -364,9 +364,12 @@ as running. Useful files:
 | `/tmp/rtmp-progress-N.txt` | ffmpeg progress for output N |
 | `/tmp/livekit.pid` | optional LiveKit pipeline |
 | `/tmp/livekit-progress.txt` | LiveKit encoder progress |
+| `/tmp/livekit-children.pids` | LiveKit encoder and publisher of the current attempt |
 
 Backoff doubles to the configured cap and resets after sustained health.
-Stalled encoders are killed and restarted. Browser failure restarts only
+Stalled encoders are killed and restarted. A stalled LiveKit pipeline is killed
+with its encoder and publisher, so a frozen encoder cannot keep the sockets the
+next attempt listens on, and leftover socket paths are removed before it starts. Browser failure restarts only
 Chromium. LiveKit failure leaves every RTMP encoder untouched.
 
 ## Prometheus observability

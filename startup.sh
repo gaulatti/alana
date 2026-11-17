@@ -36,6 +36,9 @@ ALLOW_SOFTWARE_FALLBACK="${ALLOW_SOFTWARE_FALLBACK:-0}"
 BROWSER_WAIT_FOR_URL="${BROWSER_WAIT_FOR_URL:-1}"
 BROWSER_PID_FILE=/tmp/channel-browser.pid
 LIVEKIT_PID_FILE=/tmp/livekit.pid
+# The LiveKit encoder and publisher pids, so a supervisor can stop them even when
+# livekit_once itself was killed (SIGKILL skips its trap).
+LIVEKIT_CHILDREN_FILE=/tmp/livekit-children.pids
 LIVEKIT_PROGRESS=/tmp/livekit-progress.txt
 LIVEKIT_VIDEO_SOCKET=/tmp/alana-program-video.sock
 LIVEKIT_AUDIO_SOCKET=/tmp/alana-program-audio.sock
@@ -54,15 +57,25 @@ stop_pid_file() {
     if [ -n "${pid}" ]; then kill "${pid}" 2>/dev/null || true; fi
     unlink "$1" 2>/dev/null || true
 }
+# SIGKILL also ends a stopped process, so a frozen encoder cannot outlive its leg
+# and keep the sockets that the next attempt must listen on.
+stop_livekit_children() {
+    local child
+    [ -s "${LIVEKIT_CHILDREN_FILE}" ] || return 0
+    while read -r child; do [ -n "${child}" ] && kill -9 "${child}" 2>/dev/null; done <"${LIVEKIT_CHILDREN_FILE}"
+    unlink "${LIVEKIT_CHILDREN_FILE}" 2>/dev/null || true
+    rm -f -- "${LIVEKIT_VIDEO_SOCKET}" "${LIVEKIT_AUDIO_SOCKET}"
+}
 cleanup() {
     trap - EXIT INT TERM
     for pid in "${background_pids[@]:-}"; do kill "${pid}" 2>/dev/null || true; done
     stop_pid_file "${BROWSER_PID_FILE}"
     stop_pid_file "${LIVEKIT_PID_FILE}"
+    stop_livekit_children
     for path in /tmp/rtmp-*.pid; do [ -e "${path}" ] && stop_pid_file "${path}"; done
     kill "${XVFB_PID:-}" 2>/dev/null || true
     wait 2>/dev/null || true
-    unlink "${LIVEKIT_VIDEO_SOCKET}" "${LIVEKIT_AUDIO_SOCKET}" 2>/dev/null || true
+    rm -f -- "${LIVEKIT_VIDEO_SOCKET}" "${LIVEKIT_AUDIO_SOCKET}"
 }
 trap cleanup EXIT INT TERM
 
@@ -184,22 +197,24 @@ rtmp_supervisor() (
 
 livekit_once() (
     local lk_encoder publisher
-    trap 'kill "${lk_encoder:-}" "${publisher:-}" 2>/dev/null || true; unlink "${LIVEKIT_VIDEO_SOCKET}" "${LIVEKIT_AUDIO_SOCKET}" 2>/dev/null || true' EXIT INT TERM
-    unlink "${LIVEKIT_PROGRESS}" "${LIVEKIT_VIDEO_SOCKET}" "${LIVEKIT_AUDIO_SOCKET}" 2>/dev/null || true
+    trap 'kill "${lk_encoder:-}" "${publisher:-}" 2>/dev/null || true; rm -f -- "${LIVEKIT_VIDEO_SOCKET}" "${LIVEKIT_AUDIO_SOCKET}"' EXIT INT TERM
+    # unlink(1) takes one operand; with more it removes nothing, and a stale socket
+    # path makes the next encoder fail with "Address already in use".
+    rm -f -- "${LIVEKIT_PROGRESS}" "${LIVEKIT_VIDEO_SOCKET}" "${LIVEKIT_AUDIO_SOCKET}"
     env PULSE_SERVER="$(get_pulse_socket)" ffmpeg -hide_banner -loglevel quiet -thread_queue_size 1024 \
         -f x11grab -draw_mouse "${DRAW_MOUSE}" -video_size "${RESOLUTION}" -framerate "${FPS}" -i "${DISPLAY_NUM}" \
         -thread_queue_size 1024 -f pulse -i stream_out.monitor -map 0:v:0 -an -c:v libx264 -preset "${X264_PRESET}" \
         -tune zerolatency -profile:v baseline -pix_fmt yuv420p -bf 0 -b:v "${VIDEO_BITRATE}" -g "${GOP_SIZE}" \
         -bsf:v h264_mp4toannexb -listen 1 -f h264 -progress "${LIVEKIT_PROGRESS}" "unix:${LIVEKIT_VIDEO_SOCKET}" \
         -map 1:a:0 -vn -c:a libopus -ar 48000 -ac 2 -application lowdelay -listen 1 -f opus "unix:${LIVEKIT_AUDIO_SOCKET}" >/dev/null 2>&1 &
-    lk_encoder=$!
+    lk_encoder=$!; echo "${lk_encoder}" >"${LIVEKIT_CHILDREN_FILE}"
     for _ in $(seq 1 300); do [ -S "${LIVEKIT_VIDEO_SOCKET}" ] && break; kill -0 "${lk_encoder}" 2>/dev/null || exit 1; sleep 0.1; done
     [ -S "${LIVEKIT_VIDEO_SOCKET}" ] || exit 1
     # Credentials stay in the environment instead of the process argument list.
     lk room join --identity "${LIVEKIT_IDENTITY}" --metadata "${LIVEKIT_METADATA}" \
         --publish "h264://${LIVEKIT_VIDEO_SOCKET}" --publish "opus://${LIVEKIT_AUDIO_SOCKET}" \
         --fps "${FPS}" --auto-subscribe=false "${LIVEKIT_ROOM}" >/dev/null 2>&1 &
-    publisher=$!
+    publisher=$!; echo "${publisher}" >>"${LIVEKIT_CHILDREN_FILE}"
     wait -n "${lk_encoder}" "${publisher}"
 )
 
@@ -210,6 +225,8 @@ livekit_supervisor() (
         started=$(date +%s); livekit_once & lk_child=$!; echo "${lk_child}" >"${LIVEKIT_PID_FILE}"
         stall_watchdog "${lk_child}" "${LIVEKIT_PROGRESS}" livekit & lk_watcher=$!
         wait "${lk_child}" 2>/dev/null; code=$?; kill "${lk_watcher}" 2>/dev/null || true; unlink "${LIVEKIT_PID_FILE}" 2>/dev/null || true
+        # The stall watchdog kills livekit_once with SIGKILL, which skips its trap.
+        stop_livekit_children
         metric_event restart livekit exit "${backoff}"
         duration=$(( $(date +%s) - started )); echo "[livekit] exited code=${code} duration=${duration}s retry=${backoff}s" >&2
         [ "${duration}" -ge "${HEALTHY_RESET_SECONDS}" ] && backoff="${RESTART_BACKOFF}"
