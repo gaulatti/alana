@@ -175,10 +175,13 @@ rtmp_supervisor() (
         unlink "${progress}" 2>/dev/null || true
         started=$(date +%s)
         # Never retain ffmpeg diagnostics: connection errors can repeat stream keys.
-        env PULSE_SERVER="$(get_pulse_socket)" LIBVA_DRIVER_NAME="${VAAPI_DRIVER}" ffmpeg -hide_banner -loglevel quiet -thread_queue_size 1024 \
+        # -copyts keeps both inputs on their shared wallclock (PulseAudio opens about
+        # 2 s after x11grab, so zeroing each input put audio that far ahead);
+        # make_zero then shifts every stream by one common offset to start at 0.
+        env PULSE_SERVER="$(get_pulse_socket)" LIBVA_DRIVER_NAME="${VAAPI_DRIVER}" ffmpeg -hide_banner -loglevel quiet -copyts -thread_queue_size 1024 \
             -f x11grab -draw_mouse "${DRAW_MOUSE}" -video_size "${RESOLUTION}" -framerate "${FPS}" -i "${DISPLAY_NUM}" \
             -thread_queue_size 1024 -f pulse -i stream_out.monitor -map 0:v:0 -map 1:a:0 "${VIDEO_ARGS[@]}" \
-            -c:a aac -b:a "${AUDIO_BITRATE}" -ar 44100 -ac 2 -f flv -progress "${progress}" "${output}" >/dev/null 2>&1 &
+            -c:a aac -b:a "${AUDIO_BITRATE}" -ar 44100 -ac 2 -avoid_negative_ts make_zero -f flv -progress "${progress}" "${output}" >/dev/null 2>&1 &
         rtmp_child=$!; echo "${rtmp_child}" >"${pid_file}"
         stall_watchdog "${rtmp_child}" "${progress}" "rtmp-${index}" & rtmp_watcher=$!
         wait "${rtmp_child}" 2>/dev/null; code=$?; kill "${rtmp_watcher}" 2>/dev/null || true; unlink "${pid_file}" 2>/dev/null || true
@@ -201,12 +204,13 @@ livekit_once() (
     # unlink(1) takes one operand; with more it removes nothing, and a stale socket
     # path makes the next encoder fail with "Address already in use".
     rm -f -- "${LIVEKIT_PROGRESS}" "${LIVEKIT_VIDEO_SOCKET}" "${LIVEKIT_AUDIO_SOCKET}"
-    env PULSE_SERVER="$(get_pulse_socket)" ffmpeg -hide_banner -loglevel quiet -thread_queue_size 1024 \
+    # Same shared-wallclock timestamps as the RTMP encoder.
+    env PULSE_SERVER="$(get_pulse_socket)" ffmpeg -hide_banner -loglevel quiet -copyts -thread_queue_size 1024 \
         -f x11grab -draw_mouse "${DRAW_MOUSE}" -video_size "${RESOLUTION}" -framerate "${FPS}" -i "${DISPLAY_NUM}" \
         -thread_queue_size 1024 -f pulse -i stream_out.monitor -map 0:v:0 -an -c:v libx264 -preset "${X264_PRESET}" \
         -tune zerolatency -profile:v baseline -pix_fmt yuv420p -bf 0 -b:v "${VIDEO_BITRATE}" -g "${GOP_SIZE}" \
-        -bsf:v h264_mp4toannexb -listen 1 -f h264 -progress "${LIVEKIT_PROGRESS}" "unix:${LIVEKIT_VIDEO_SOCKET}" \
-        -map 1:a:0 -vn -c:a libopus -ar 48000 -ac 2 -application lowdelay -listen 1 -f opus "unix:${LIVEKIT_AUDIO_SOCKET}" >/dev/null 2>&1 &
+        -bsf:v h264_mp4toannexb -listen 1 -avoid_negative_ts make_zero -f h264 -progress "${LIVEKIT_PROGRESS}" "unix:${LIVEKIT_VIDEO_SOCKET}" \
+        -map 1:a:0 -vn -c:a libopus -ar 48000 -ac 2 -application lowdelay -listen 1 -avoid_negative_ts make_zero -f opus "unix:${LIVEKIT_AUDIO_SOCKET}" >/dev/null 2>&1 &
     lk_encoder=$!; echo "${lk_encoder}" >"${LIVEKIT_CHILDREN_FILE}"
     for _ in $(seq 1 300); do [ -S "${LIVEKIT_VIDEO_SOCKET}" ] && break; kill -0 "${lk_encoder}" 2>/dev/null || exit 1; sleep 0.1; done
     [ -S "${LIVEKIT_VIDEO_SOCKET}" ] || exit 1

@@ -38,6 +38,11 @@ restart another RTMP destination or the optional LiveKit leg. LiveKit uses its
 own encoder and publisher supervisor and never auto-subscribes to caller tracks.
 
 Chromium and PulseAudio are shared capture inputs with independent watchdogs.
+Every encoder (each RTMP leg, LiveKit and the recorder) keeps its x11grab and
+PulseAudio inputs on their shared wallclock (`-copyts`) and shifts all streams
+by one common offset to start at zero (`-avoid_negative_ts make_zero`).
+Zeroing each input on its own put audio about 2 s ahead of video, because the
+PulseAudio input starts delivering after x11grab.
 Container shutdown terminates every tracked browser, encoder, publisher,
 watchdog, and virtual-display process and removes PID/socket state.
 The recorder is a separate opt-in supervisor. Its failure state and restart

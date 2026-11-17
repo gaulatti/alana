@@ -468,7 +468,11 @@ def capture_command(
     audio_bitrate = os.environ.get("RECORDING_AUDIO_BITRATE", os.environ.get("AUDIO_BITRATE", "128k"))
     progress = operation_dir / "capture-progress.txt"
     pattern = operation_dir / "segment-%06d.mkv"
-    command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y"]
+    # -copyts keeps the video and PulseAudio inputs on their shared wallclock;
+    # zeroing each input on its own put audio about 2 s ahead of video, because
+    # PulseAudio starts delivering later. make_zero (below) shifts every stream
+    # by one common offset so segments still start at 0.
+    command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-copyts"]
     if synthetic:
         resolution = os.environ.get("RECORDING_TEST_RESOLUTION", "640x360")
         fps = os.environ.get("RECORDING_TEST_FPS", "30")
@@ -552,6 +556,8 @@ def capture_command(
         [
             "-progress",
             str(progress),
+            "-avoid_negative_ts",
+            "make_zero",
             "-f",
             "segment",
             "-segment_format",
