@@ -55,8 +55,8 @@ chain_error=$(python3 "$(dirname "${BASH_SOURCE[0]}")/audio_chain.py" filter 1:a
     || fail "${chain_error:-processed audio settings are invalid}"
 unset chain_error
 
-# Opt-in effective live profile (gaulatti/alana#29); off keeps every filler path as before.
-case "${ALANA_LIVE_PROFILE:-off}" in
+# Effective live profile (gaulatti/alana#29), on by default; off is the kill switch.
+case "${ALANA_LIVE_PROFILE:-on}" in
     on|off) ;;
     *) fail "ALANA_LIVE_PROFILE must be on or off" ;;
 esac

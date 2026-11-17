@@ -106,8 +106,8 @@ def profile_checksum(profile: dict[str, object]) -> str:
 
 
 def live_profile_enabled(environ: Mapping[str, str] = os.environ) -> bool:
-    """``ALANA_LIVE_PROFILE``: off by default; on publishes and binds the live profile."""
-    value = environ.get("ALANA_LIVE_PROFILE", "") or "off"
+    """``ALANA_LIVE_PROFILE``: on by default (publish and bind); off is the kill switch."""
+    value = environ.get("ALANA_LIVE_PROFILE", "") or "on"
     if value not in ("on", "off"):
         raise ValueError("ALANA_LIVE_PROFILE must be on or off")
     return value == "on"
@@ -160,7 +160,7 @@ def effective_live_profile(
 def configured_live_profile(
     environ: Mapping[str, str] = os.environ,
 ) -> dict[str, object] | None:
-    """The live-profile document, or None when the opt-in setting is off.
+    """The live-profile document, or None under the ALANA_LIVE_PROFILE=off kill switch.
 
     With the setting on and an unqualified configuration, ``profile`` is None:
     nothing is published and no filler can become ready."""
@@ -876,7 +876,7 @@ class LifecycleManager:
         self.store = store
         self.pipeline = pipeline
         self.croccante = croccante
-        # None while ALANA_LIVE_PROFILE is off: every filler path is exactly as before.
+        # None only with the ALANA_LIVE_PROFILE=off kill switch: every filler path is then as before #29.
         self.live_profile = live_profile
         self.sleep = sleep
         self.monotonic = monotonic

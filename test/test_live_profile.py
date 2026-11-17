@@ -132,16 +132,18 @@ class EffectiveProfileTests(unittest.TestCase):
             hashlib.sha256(canonical.encode()).hexdigest(),
         )
 
-    def test_setting_is_off_by_default_and_strict(self):
-        self.assertFalse(control.live_profile_enabled({}))
-        self.assertFalse(control.live_profile_enabled({"ALANA_LIVE_PROFILE": ""}))
-        self.assertFalse(control.live_profile_enabled({"ALANA_LIVE_PROFILE": "off"}))
+    def test_setting_is_on_by_default_and_strict(self):
+        self.assertTrue(control.live_profile_enabled({}))
+        self.assertTrue(control.live_profile_enabled({"ALANA_LIVE_PROFILE": ""}))
         self.assertTrue(control.live_profile_enabled(ON))
+        # off stays the kill switch.
+        self.assertFalse(control.live_profile_enabled({"ALANA_LIVE_PROFILE": "off"}))
         with self.assertRaises(ValueError):
             control.live_profile_enabled({"ALANA_LIVE_PROFILE": "1"})
 
     def test_configured_document(self):
-        self.assertIsNone(control.configured_live_profile({}))
+        self.assertIsNone(control.configured_live_profile({"ALANA_LIVE_PROFILE": "off"}))
+        self.assertEqual(control.configured_live_profile({}), control.configured_live_profile(ON))
         document = control.configured_live_profile(ON)
         self.assertEqual(document["profile"], DEFAULT_PROFILE)
         self.assertEqual(document["checksum"], control.profile_checksum(DEFAULT_PROFILE))
@@ -572,7 +574,7 @@ class OffPathTests(LifecycleFixture):
 class MainWiringTests(unittest.TestCase):
     """main() builds the manager from the process environment, as in the image."""
 
-    def run_main(self, environment):
+    def run_main(self, environment, unset=()):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         root = Path(temp.name)
@@ -607,6 +609,8 @@ class MainWiringTests(unittest.TestCase):
             patch.object(control.signal, "signal", lambda *_: None),
             redirect_stdout(StringIO()) as output,
         ):
+            for name in unset:
+                os.environ.pop(name, None)
             control.main()
         self.assertEqual(validations, [(("/usr/local/bin/validate-config.sh",), True)])
         self.assertTrue(control.MANAGER.closed.is_set())
@@ -620,6 +624,17 @@ class MainWiringTests(unittest.TestCase):
         manager, output = self.run_main({"ALANA_LIVE_PROFILE": "off"})
         self.assertIsNone(manager.live_profile)
         self.assertIn("[control] live profile off", output)
+
+    def test_unset_setting_serves_software_encoding_and_withholds_gpu_modes(self):
+        unset = ("ALANA_LIVE_PROFILE", "GPU_TYPE", "VIDEO_ENCODER")
+        manager, output = self.run_main({}, unset=unset)
+        self.assertEqual(manager.live_profile["profile"], DEFAULT_PROFILE)
+        self.assertIn("[control] live profile published", output)
+        for gpu in ({"GPU_TYPE": "NVIDIA"}, {"GPU_TYPE": "INTEL"}, {"VIDEO_ENCODER": "h264_nvenc"}, {"VIDEO_ENCODER": "h264_vaapi"}):
+            with self.subTest(gpu=gpu):
+                manager, output = self.run_main(gpu, unset=("ALANA_LIVE_PROFILE",))
+                self.assertEqual(manager.live_profile_state(), "unqualified")
+                self.assertIn("[control] live profile unqualified", output)
 
 
 class LiveProfileMetricTests(unittest.TestCase):
@@ -704,6 +719,16 @@ class LiveProfileHttpTests(unittest.TestCase):
         self.assertIn('alana_live_profile_state{state="off"} 0', metrics)
         self.assertIn('alana_http_requests_total{method="GET",route="live_profile",status_class="2xx"} 1', metrics)
         self.assertIn('alana_http_requests_total{method="GET",route="live_profile",status_class="4xx"} 3', metrics)
+
+    def test_unset_setting_answers_200_on_software_and_404_on_nvenc_and_vaapi(self):
+        self.use(control.configured_live_profile({}))
+        status, text = self.get(control.LIVE_PROFILE_PATH)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(text)["profile"], DEFAULT_PROFILE)
+        for gpu in ({"GPU_TYPE": "NVIDIA"}, {"GPU_TYPE": "INTEL"}, {"VIDEO_ENCODER": "h264_nvenc"}, {"VIDEO_ENCODER": "h264_vaapi"}):
+            with self.subTest(gpu=gpu):
+                self.use(control.configured_live_profile(gpu))
+                self.assertEqual(self.get(control.LIVE_PROFILE_PATH)[0], 404)
 
     def test_off_and_unqualified_answer_404(self):
         for live, state in (
