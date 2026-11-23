@@ -233,11 +233,13 @@ within its bounded budget. A control-process or container restart resumes a
 persisted Requested/Active operation. An explicit Stop changes state to
 Finalizing, verifies every segment checksum, remuxes without transcoding, probes
 the MP4, and reports Complete only with its final checksum and media metadata.
-The remux places each segment where the previous segment's video ends, not at
-its container duration, which also counts the audio frame that overhangs the
-cut; concatenating by container duration made audio drift about 1.5 ms per
-second ahead of video over the recording.
-A recording is never refused for this: if any segment's video span cannot be
+The remux places each segment where the previous segment's audio ends, counted
+in AAC samples. The capture's audio is one continuous run of samples and is
+played that way, so placing segments by anything else lets audio drift against
+video: by container duration about 1.5 ms per second ahead, by video span about
+16 ms per minute behind. Placed by sample count, a 10-minute recording stays
+within the measurement's own jitter (see "Recording drift measurement").
+A recording is never refused for this: if any segment's audio cannot be
 measured, the remux joins by container duration as before, keeps every
 segment, logs `event=finalize state=finalizing result=span-unavailable`, and
 records `finalizationMethod` `fallback` (otherwise `exact`) in the manifest.
@@ -255,6 +257,37 @@ required artifact and manifest outside the container volume, then remove only
 the selected inactive `operations/<operationId>` directory. Never remove the
 recording root or current operation while its state is Requested, Active, or
 Finalizing.
+
+### Recording drift measurement
+
+`test/drift/run.py` measures how far audio moves against video over a whole
+recording. It runs the built image unmodified in private tape mode (no RTMP,
+LiveKit or Croccante), with `test/drift/page.html` as the program: a flash and a
+1 kHz beep every 10 s, both timed from the page's audio clock. It records for
+`--seconds`, finalizes, downloads `program.mp4`, and fits the audio-minus-video
+offset of every event against time:
+
+```sh
+docker build -t alana:local .
+python3 test/drift/run.py --image alana:local --seconds 600 --runs 3 --output drift.json
+```
+
+The report gives, per run and as medians, the slope (ms per minute), the fitted
+change over the span, the first-to-last change and the spread, with the host's
+load average before and after. `steady` repeats the fit without the first event:
+the capture's first seconds carry a start-up offset of their own, visible inside
+the first raw segment before any join. Compare runs only on a quiet machine. `--env
+NAME=VALUE` passes an extra container setting, and `--keep DIR` (with
+`--keep-segments`) keeps each `program.mp4` and its raw segments for offline
+analysis. The control token is generated per run, mounted read-only and never
+printed; containers are removed afterwards. It needs Docker and
+`ffmpeg`/`ffprobe` on the host, and on macOS it keeps its work files under the
+home folder, which Docker's VM can mount.
+
+Until gaulatti/alana#33 and gaulatti/alana#34 are fixed, a tape's browser and
+display are stopped within one `CONTROL_RETRY_SECONDS`, and the processed audio
+chain drops the shared timeline, so measure with a build carrying the #33 guard
+and `--env ALANA_PROCESSED_AUDIO=off`.
 
 Filler preparation is a separate authenticated machine operation. The `PUT`
 uses an `Idempotency-Key` equal to the bounded `commandId` in the JSON body and

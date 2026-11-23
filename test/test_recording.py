@@ -493,7 +493,8 @@ class RecordingDriftTests(unittest.TestCase):
         from recording import finalize_recording
 
         real_run = subprocess.run
-        for name, answer in (("no video packets", {"packets": []}), ("unreadable timing", {"packets": [{"pts_time": "x"}]}), ("probe failure", None)):
+        aac = [{"codec_name": "aac", "sample_rate": "48000"}]
+        for name, answer in (("no audio packets", {"streams": aac, "packets": []}), ("unreadable timing", {"streams": aac, "packets": [{"pts_time": "x"}]}), ("probe failure", None)):
             with self.subTest(case=name):
                 self.temp.cleanup()
                 self.temp = tempfile.TemporaryDirectory()
@@ -501,7 +502,7 @@ class RecordingDriftTests(unittest.TestCase):
                 store, state = self.capture_flash_and_beep(11)
 
                 def span_probe_breaks(command, *args, _answer=answer, **kwargs):
-                    if "packet=pts_time,duration_time" in command:
+                    if "format=start_time:stream=codec_name,sample_rate:packet=pts_time" in command:
                         if _answer is None:
                             raise subprocess.CalledProcessError(1, command)
                         return subprocess.CompletedProcess(command, 0, stdout=json.dumps(_answer), stderr="")
@@ -535,25 +536,69 @@ class RecordingDriftTests(unittest.TestCase):
         self.assertTrue(finalize_recording(store, state))
         operation = store.operation_dir("0123456789abcdef")
         self.assertEqual(store.load(enabled=True)["finalizationMethod"], "exact")
-        self.assertEqual((operation / "concat.txt").read_text(encoding="utf-8").count("duration "), store.load(enabled=True)["segmentCount"])
+        # Every segment but the last is placed by a duration; the last needs none.
+        self.assertEqual((operation / "concat.txt").read_text(encoding="utf-8").count("duration "), store.load(enabled=True)["segmentCount"] - 1)
 
 
-class SegmentVideoSpanTests(unittest.TestCase):
+class SegmentAudioTimingTests(unittest.TestCase):
+    AAC = [{"codec_name": "aac", "sample_rate": "48000"}]
+    START = {"start_time": "0.000000"}
+
     def probe(self, payload):
-        from recording import segment_video_span
+        from recording import segment_audio_timing
 
         answer = subprocess.CompletedProcess([], 0, stdout=json.dumps(payload), stderr="")
         with patch("recording.subprocess.run", return_value=answer):
-            return segment_video_span(Path("segment-000000.mkv"))
+            return segment_audio_timing(Path("segment-000000.mkv"))
 
-    def test_span_runs_from_the_first_frame_to_the_end_of_the_last(self):
-        packets = [{"pts_time": "0.100000", "duration_time": "0.033333"}, {"pts_time": "0.000000", "duration_time": "0.033333"}]
-        self.assertAlmostEqual(self.probe({"packets": packets}), 0.133333, places=6)
+    def test_timing_is_the_first_packet_from_the_file_start_and_the_sample_count(self):
+        packets = [{"pts_time": "0.042000"}, {"pts_time": "0.021000"}, {"pts_time": "0.064000"}]
+        first, length = self.probe({"format": {"start_time": "0.000000"}, "streams": self.AAC, "packets": packets})
+        self.assertAlmostEqual(first, 0.021, places=6)
+        # A first segment whose file starts at its priming delay: the concat demuxer removes it.
+        first, _ = self.probe({"format": {"start_time": "0.021000"}, "streams": self.AAC, "packets": packets})
+        self.assertAlmostEqual(first, 0.0, places=6)
+        self.assertAlmostEqual(length, 3 * 1024 / 48000, places=9)
 
-    def test_a_segment_without_usable_video_timing_is_refused(self):
-        for payload in ({"packets": []}, {}, ["packets"], {"packets": [{"pts_time": "0", "duration_time": "0"}]}, {"packets": [{"pts_time": "nan", "duration_time": "1"}]}):
+    def test_a_segment_without_usable_audio_timing_is_refused(self):
+        for payload in (
+            {"streams": self.AAC, "packets": []}, {"packets": [{"pts_time": "0"}]}, {}, ["packets"],
+            {"streams": self.AAC, "packets": [{"pts_time": "0"}]}, {"format": {}, "streams": self.AAC, "packets": [{"pts_time": "0"}]},
+            {"format": {"start_time": "x"}, "streams": self.AAC, "packets": [{"pts_time": "0"}]},
+            {"format": self.START, "streams": [{"codec_name": "opus", "sample_rate": "48000"}], "packets": [{"pts_time": "0"}]},
+            {"format": self.START, "streams": [{"codec_name": "aac", "sample_rate": "0"}], "packets": [{"pts_time": "0"}]},
+            {"format": self.START, "streams": [{"codec_name": "aac"}], "packets": [{"pts_time": "0"}]},
+            {"format": self.START, "streams": self.AAC, "packets": [{"pts_time": "nan"}]},
+            {"format": self.START, "streams": self.AAC, "packets": [{"pts_time": "x"}]},
+        ):
             with self.subTest(payload=payload), self.assertRaises(ValueError):
                 self.probe(payload)
+
+
+class AudioAnchoredDurationTests(unittest.TestCase):
+    def test_each_segment_starts_where_the_previous_audio_ends(self):
+        from recording import audio_anchored_durations
+
+        # Audio of 5 s starting at 0.021 in the first segment and at 0.000 in the next.
+        self.assertEqual([round(value, 6) for value in audio_anchored_durations([(0.021, 5.0), (0.0, 5.0), (0.013, 4.5)])], [5.021, 4.987])
+        self.assertEqual(audio_anchored_durations([(0.0, 5.0)]), [])
+
+    def test_positions_telescope_so_rounding_never_accumulates(self):
+        from recording import audio_anchored_durations
+
+        timings = [(0.001 * (index % 3), 234 * 1024 / 48000) for index in range(120)]
+        durations = audio_anchored_durations(timings)
+        # Segment k starts at the sum of the earlier durations; its audio then starts at
+        # k audio lengths exactly, whatever each segment's own first timestamp was.
+        start = sum(durations[:119]) + timings[119][0]
+        self.assertAlmostEqual(start - timings[0][0], 119 * 234 * 1024 / 48000, places=9)
+
+    def test_audio_that_does_not_continue_is_refused(self):
+        from recording import audio_anchored_durations
+
+        for timings in ([(0.0, 1.0), (1.0, 1.0)], [(0.0, 1.0), (2.0, 1.0)], [(0.0, float("nan")), (0.0, 1.0)]):
+            with self.subTest(timings=timings), self.assertRaises(ValueError):
+                audio_anchored_durations(timings)
 
 
 class FinalizeJoinTests(unittest.TestCase):
@@ -588,7 +633,7 @@ class FinalizeJoinTests(unittest.TestCase):
         from recording import finalize_recording
 
         def fake_run(command, *args, **kwargs):
-            if command[0] == "ffprobe" and "packet=pts_time,duration_time" in command:
+            if command[0] == "ffprobe" and "format=start_time:stream=codec_name,sample_rate:packet=pts_time" in command:
                 return subprocess.CompletedProcess(command, 0, stdout=json.dumps(span_answer(Path(command[-1]).name)), stderr="")
             if command[0] == "ffmpeg":
                 self.remuxes.append((self.operation / "concat.txt").read_text(encoding="utf-8"))
@@ -606,27 +651,31 @@ class FinalizeJoinTests(unittest.TestCase):
         return result, events
 
     @staticmethod
-    def packets(first, count=150, step=1 / 30):
-        return {"packets": [{"pts_time": f"{first + index * step:.6f}", "duration_time": f"{step:.6f}"} for index in range(count)]}
+    def packets(first, count=234, step=1024 / 48000):
+        return {"format": {"start_time": "0.000000"}, "streams": [{"codec_name": "aac", "sample_rate": "48000"}],
+                "packets": [{"pts_time": f"{first + index * step:.6f}"} for index in range(count)]}
 
     def saved(self):
         return self.store.load(enabled=True)
 
-    def test_readable_segments_join_exactly_by_their_video_spans(self):
+    def test_readable_segments_join_exactly_by_their_audio(self):
         result, events = self.run_finalize(lambda name: self.packets(0.021))
         self.assertTrue(result)
         self.assertEqual(self.saved()["finalizationMethod"], "exact")
         self.assertEqual(self.saved()["finalizationState"], "verified")
         concat = self.remuxes[0]
-        self.assertEqual(concat.count("duration 5.000000\n"), 3)
+        # 234 AAC packets of 1024 samples at 48 kHz: 4.992 s each, the last segment unplaced.
+        self.assertEqual(concat.count("duration 4.992000\n"), 2)
+        self.assertEqual(concat.count("duration "), 2)
         self.assertEqual([line for line in concat.splitlines() if line.startswith("file ")], [f"file '{r['file']}'" for r in self.records])
         self.assertEqual(json.loads((self.operation / "manifest.json").read_text(encoding="utf-8"))["finalizationMethod"], "exact")
         self.assertNotIn(unittest.mock.call("finalize", "finalizing", "span-unavailable", 3), events.mock_calls)
 
     def test_an_unmeasurable_segment_falls_back_to_the_previous_join_and_keeps_the_recording(self):
         failures = {
-            "no video packets": lambda name: {"packets": []} if name.endswith("1.mkv") else self.packets(0.0),
-            "unreadable timing": lambda name: {"packets": [{"pts_time": "x"}]} if name.endswith("2.mkv") else self.packets(0.0),
+            "no audio packets": lambda name: {**self.packets(0.0), "packets": []} if name.endswith("1.mkv") else self.packets(0.0),
+            "unreadable timing": lambda name: {**self.packets(0.0), "packets": [{"pts_time": "x"}]} if name.endswith("2.mkv") else self.packets(0.0),
+            "audio that does not continue": lambda name: self.packets(9.0) if name.endswith("1.mkv") else self.packets(0.0),
             "probe failure": lambda name: (_ for _ in ()).throw(subprocess.CalledProcessError(1, ["ffprobe"])),
             "not json": lambda name: (_ for _ in ()).throw(json.JSONDecodeError("bad", "", 0)),
         }
