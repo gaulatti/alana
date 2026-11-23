@@ -50,6 +50,7 @@ class FakePipeline:
         self.events = events
         self.is_running = running
         self.is_ready = ready
+        self.tape = False
 
     def running(self):
         return self.is_running
@@ -59,6 +60,7 @@ class FakePipeline:
             return
         self.events.append("pipeline:start-tape" if tape else "pipeline:start")
         self.is_running = True
+        self.tape = tape
 
     def ready(self):
         return self.is_running and self.is_ready
@@ -69,6 +71,7 @@ class FakePipeline:
     def stop(self):
         self.events.append("pipeline:stop")
         self.is_running = False
+        self.tape = False
 
 
 class FakeRecording:
@@ -397,6 +400,23 @@ class LifecycleTests(unittest.TestCase):
         self.manager.reconcile_once()
         self.assertEqual(self.events, ["croccante:stop", "croccante:stop", "pipeline:stop"])
         self.assertEqual(self.manager.view()["actualState"], "stopped")
+
+    def test_running_tape_survives_reconcile_ticks_while_stop_is_requested(self):
+        # gaulatti/alana#33: the normal state while taping is requestedState "stopped".
+        self.pipeline.start(tape=True)
+        self.assertEqual(self.manager.state.get("requestedState"), "stopped")
+        self.events.clear()
+        for _ in range(5):
+            self.manager.reconcile_once()
+        self.assertTrue(self.pipeline.running())
+        self.assertNotIn("pipeline:stop", self.events)
+
+    def test_stop_without_tape_still_stops_the_pipeline_on_reconcile(self):
+        self.pipeline.start(tape=False)
+        self.events.clear()
+        self.manager.reconcile_once()
+        self.assertFalse(self.pipeline.running())
+        self.assertEqual(self.events, ["pipeline:stop"])
 
     def test_publisher_drop_recovers_without_stop_command(self):
         self.manager.command("start", "start", 1, self.destination_selection())
