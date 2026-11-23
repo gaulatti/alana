@@ -1183,6 +1183,18 @@ class TapeControllerEdgeTests(unittest.TestCase):
         self.assertEqual(status, 409)
         self.assertEqual(payload["commandResult"]["result"], "already-active")
 
+    def test_tape_stop_still_tears_the_pipeline_down_after_reconcile_ticks(self):
+        # gaulatti/alana#33: the guard leaves the pipeline to the tape, so Tape Stop must still stop it.
+        self.tape.command("start", "tape-1")
+        self.assertTrue(self.manager.pipeline.running())
+        for _ in range(3):
+            self.manager.reconcile_once()
+        self.assertTrue(self.manager.pipeline.running())
+        status, payload = self.tape.command("stop", "tape-2")
+        self.assertFalse(self.manager.pipeline.running())
+        self.assertIn("pipeline:stop", self.events)
+        self.assertFalse(self.tape.active)
+
     def test_recorder_rejection_tears_down_and_reports_its_reason(self):
         self.recording.command = lambda action, key: (
             507, {**self.recording.state, "commandResult": {"result": "disk-exhausted"}}
