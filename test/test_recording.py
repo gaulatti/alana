@@ -176,6 +176,29 @@ class RecordingContractTests(unittest.TestCase):
         (self.root / "segment-000003.mkv").write_bytes(b"closed")
         self.assertEqual(next_sequence(self.root), 5)
 
+    def test_state_persisted_as_disabled_by_the_previous_release_loads_as_idle(self):
+        store = RecordingStore(self.root)
+        store.state_file.write_text(
+            json.dumps({"enabled": False, "state": "disabled", "operationId": None}),
+            encoding="utf-8",
+        )
+        controller = RecordingController(
+            self.root,
+            ready=lambda: True,
+            start_monitor=False,
+        )
+        try:
+            self.assertEqual(controller.status()["state"], "idle")
+            self.assertEqual(
+                json.loads(store.state_file.read_text(encoding="utf-8"))["state"],
+                "idle",
+            )
+            status, state = controller.start("after-disabled")
+            self.assertNotEqual(status, 500)
+            self.assertNotEqual(state.get("error"), "manifest-corrupt")
+        finally:
+            controller.close()
+
     def test_corrupt_state_fails_closed_instead_of_resetting(self):
         store = RecordingStore(self.root)
         store.state_file.write_text("{not-json", encoding="utf-8")

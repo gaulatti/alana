@@ -217,6 +217,11 @@ class RecordingStore:
                     "updatedAt": stamp,
                 }
             self.save(state)
+        if state.get("state") == "disabled":
+            # A previous release persisted "disabled" while recording was off.
+            state["state"] = "idle"
+            state["finalizationState"] = "not-requested"
+            self.save(state)
         if state.get("state") not in RECORDING_STATES:
             state["state"] = "failed"
             state["error"] = "manifest-corrupt"
