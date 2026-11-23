@@ -687,25 +687,60 @@ class AudioAnchoredDurationTests(unittest.TestCase):
         from recording import audio_anchored_durations
 
         # Audio of 5 s starting at 0.021 in the first segment and at 0.000 in the next.
-        self.assertEqual([round(value, 6) for value in audio_anchored_durations([(0.021, 5.0), (0.0, 5.0), (0.013, 4.5)])], [5.021, 4.987])
-        self.assertEqual(audio_anchored_durations([(0.0, 5.0)]), [])
+        durations, fallbacks = audio_anchored_durations([(0.021, 5.0), (0.0, 5.0), (0.013, 4.5)])
+        self.assertEqual([round(value, 6) for value in durations], [5.021, 4.987])
+        self.assertEqual(fallbacks, 0)
+        self.assertEqual(audio_anchored_durations([(0.0, 5.0)]), ([], 0))
 
     def test_positions_telescope_so_rounding_never_accumulates(self):
         from recording import audio_anchored_durations
 
         timings = [(0.001 * (index % 3), 234 * 1024 / 48000) for index in range(120)]
-        durations = audio_anchored_durations(timings)
+        durations, fallbacks = audio_anchored_durations(timings)
+        self.assertEqual(fallbacks, 0)
         # Segment k starts at the sum of the earlier durations; its audio then starts at
         # k audio lengths exactly, whatever each segment's own first timestamp was.
         start = sum(durations[:119]) + timings[119][0]
         self.assertAlmostEqual(start - timings[0][0], 119 * 234 * 1024 / 48000, places=9)
 
-    def test_audio_that_does_not_continue_is_refused(self):
+    def test_one_unmeasurable_middle_segment_costs_only_its_own_placement(self):
         from recording import audio_anchored_durations
 
-        for timings in ([(0.0, 1.0), (1.0, 1.0)], [(0.0, 1.0), (2.0, 1.0)], [(0.0, float("nan")), (0.0, 1.0)]):
-            with self.subTest(timings=timings), self.assertRaises(ValueError):
-                audio_anchored_durations(timings)
+        # gaulatti/alana#38: the fifth of ten segments cannot be measured.
+        length = 234 * 1024 / 48000
+        timings = [(0.002, length)] * 10
+        timings[4] = None
+        durations, fallbacks = audio_anchored_durations(timings)
+        self.assertEqual(fallbacks, 1)
+        # Every other segment keeps its audio anchor.
+        for index, duration in enumerate(durations):
+            with self.subTest(segment=index):
+                if index == 4:
+                    self.assertIsNone(duration, "placed by its container duration")
+                elif index == 3:
+                    # Ends at its own audio end; the unmeasured next segment's lead is unknown.
+                    self.assertAlmostEqual(duration, 0.002 + length, places=9)
+                else:
+                    self.assertAlmostEqual(duration, length, places=9)
+
+    def test_audio_that_does_not_continue_falls_back_for_that_segment_only(self):
+        from recording import audio_anchored_durations
+
+        for timings, expected in (
+            ([(0.0, 1.0), (1.0, 1.0)], [None]),
+            ([(0.0, 1.0), (2.0, 1.0)], [None]),
+            ([(0.0, float("nan")), (0.0, 1.0)], [None]),
+            ([(0.0, 1.0), (2.0, 1.0), (0.0, 1.0)], [None, 3.0]),
+        ):
+            with self.subTest(timings=timings):
+                durations, fallbacks = audio_anchored_durations(timings)
+                self.assertEqual(durations, expected)
+                self.assertEqual(fallbacks, 1)
+
+    def test_every_segment_unmeasurable_is_the_join_before_32(self):
+        from recording import audio_anchored_durations
+
+        self.assertEqual(audio_anchored_durations([None, None, None]), ([None, None], 3))
 
 
 class FinalizeJoinTests(unittest.TestCase):
@@ -776,13 +811,51 @@ class FinalizeJoinTests(unittest.TestCase):
         self.assertEqual(concat.count("duration "), 2)
         self.assertEqual([line for line in concat.splitlines() if line.startswith("file ")], [f"file '{r['file']}'" for r in self.records])
         self.assertEqual(json.loads((self.operation / "manifest.json").read_text(encoding="utf-8"))["finalizationMethod"], "exact")
-        self.assertNotIn(unittest.mock.call("finalize", "finalizing", "span-unavailable", 3), events.mock_calls)
+        self.assertEqual(self.saved()["fallbackSegments"], 0)
+        self.assertFalse([call for call in events.mock_calls if call.args[2:3] == ("span-unavailable",)])
 
-    def test_an_unmeasurable_segment_falls_back_to_the_previous_join_and_keeps_the_recording(self):
+    def test_one_unmeasurable_segment_keeps_every_other_anchor_and_the_recording(self):
+        # gaulatti/alana#38: a fallback costs only the failing segment's own placement.
+        length = 234 * 1024 / 48000
         failures = {
-            "no audio packets": lambda name: {**self.packets(0.0), "packets": []} if name.endswith("1.mkv") else self.packets(0.0),
-            "unreadable timing": lambda name: {**self.packets(0.0), "packets": [{"pts_time": "x"}]} if name.endswith("2.mkv") else self.packets(0.0),
-            "audio that does not continue": lambda name: self.packets(9.0) if name.endswith("1.mkv") else self.packets(0.0),
+            # segment 1 of 0..2 has no audio: segment 0 ends at its audio end, segment 1 by its container.
+            "no audio packets": (
+                lambda name: {**self.packets(0.0), "packets": []} if name.endswith("1.mkv") else self.packets(0.0),
+                [f"duration {length:.6f}", None],
+            ),
+            # the last segment is unreadable: segment 0 anchored to segment 1, segment 1 to its own audio end.
+            "unreadable timing": (
+                lambda name: {**self.packets(0.0), "packets": [{"pts_time": "x"}]} if name.endswith("2.mkv") else self.packets(0.0),
+                [f"duration {length:.6f}", f"duration {length:.6f}"],
+            ),
+            # segment 1's audio starts after segment 0's ends: only segment 0 falls back.
+            "audio that does not continue": (
+                lambda name: self.packets(9.0) if name.endswith("1.mkv") else self.packets(0.0),
+                [None, f"duration {9.0 + length:.6f}"],
+            ),
+        }
+        for case, (answer, expected) in failures.items():
+            with self.subTest(case=case):
+                self.remuxes.clear()
+                self.state.update(state="active", finalizationState="not-requested")
+                self.state.pop("finalizationMethod", None)
+                result, events = self.run_finalize(answer)
+                self.assertTrue(result)
+                saved = self.saved()
+                self.assertEqual((saved["state"], saved["finalizationMethod"], saved["fallbackSegments"]), ("complete", "fallback", 1))
+                manifest = json.loads((self.operation / "manifest.json").read_text(encoding="utf-8"))
+                self.assertEqual((manifest["finalizationMethod"], manifest["fallbackSegments"]), ("fallback", 1))
+                lines = self.remuxes[0].splitlines()
+                placed = []
+                for index, record in enumerate(self.records[:-1]):
+                    position = lines.index(f"file '{record['file']}'")
+                    following = lines[position + 1] if position + 1 < len(lines) else ""
+                    placed.append(following if following.startswith("duration ") else None)
+                self.assertEqual(placed, expected)
+                events.assert_any_call("finalize", "finalizing", "span-unavailable", 1)
+
+    def test_every_segment_unmeasurable_is_the_join_before_32_and_keeps_the_recording(self):
+        failures = {
             "probe failure": lambda name: (_ for _ in ()).throw(subprocess.CalledProcessError(1, ["ffprobe"])),
             "not json": lambda name: (_ for _ in ()).throw(json.JSONDecodeError("bad", "", 0)),
         }
@@ -796,6 +869,7 @@ class FinalizeJoinTests(unittest.TestCase):
                 saved = self.saved()
                 self.assertEqual((saved["state"], saved["finalizationState"], saved["finalizationMethod"]), ("complete", "verified", "fallback"))
                 self.assertEqual(json.loads((self.operation / "manifest.json").read_text(encoding="utf-8"))["finalizationMethod"], "fallback")
+                self.assertEqual(saved["fallbackSegments"], 3)
                 self.assertEqual(self.remuxes, ["".join(f"file '{r['file']}'\n" for r in self.records)], "the join before #32, every segment kept")
                 events.assert_any_call("finalize", "finalizing", "span-unavailable", 3)
                 self.assertTrue((self.operation / "program.mp4").exists())

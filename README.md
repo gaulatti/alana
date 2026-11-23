@@ -248,10 +248,19 @@ played that way, so placing segments by anything else lets audio drift against
 video: by container duration about 1.5 ms per second ahead, by video span about
 16 ms per minute behind. Placed by sample count, a 10-minute recording stays
 within the measurement's own jitter (see "Recording drift measurement").
-A recording is never refused for this: if any segment's audio cannot be
-measured, the remux joins by container duration as before, keeps every
-segment, logs `event=finalize state=finalizing result=span-unavailable`, and
-records `finalizationMethod` `fallback` (otherwise `exact`) in the manifest.
+A recording is never refused for this. A segment whose audio cannot be
+measured (no audio packets, not AAC, unreadable timing), or whose audio does not
+continue into the next segment, is placed by its own container duration, and
+every other segment keeps its audio anchor (#38). So one such segment costs at
+most its own placement, not the sync of the whole recording. A measured segment
+followed by an unmeasured one ends at its own audio end, since the next
+segment's lead is unknown; that's a few milliseconds.
+
+The remux keeps every segment. When any segment falls back, it logs
+`event=finalize state=finalizing result=span-unavailable count=<segments that
+fell back>`. The manifest records `finalizationMethod` (`exact` when every
+segment was anchored, otherwise `fallback`) and `fallbackSegments`. When every
+segment falls back, the join is the container-duration join from before #32.
 
 Free space and all retained bytes below the recording root, including state and
 idempotency command records, are checked before Start and while recording.
