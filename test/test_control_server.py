@@ -45,6 +45,38 @@ def unrecognized_count(boundary, kind):
     return control.METRICS.counters.get(key, 0)
 
 
+# The live profile these tests run under; it equals LifecycleTests.filler_payload()'s profile.
+LIVE_PROFILE = control.configured_live_profile({"AUDIO_BITRATE": "160k"})
+FILLER_PROFILE = {
+    "width": 1920,
+    "height": 1080,
+    "fps": 30,
+    "videoBitrate": "6000k",
+    "audioRate": 48000,
+    "audioChannels": 2,
+    "audioBitrate": "160k",
+    "gop": 60,
+    "loopSeconds": 10,
+}
+
+
+def ready_filler(version="filler-v1", source="source-one", **changes):
+    """A prepared filler as Alana stores it once Croccante's acknowledgement is bound to the live profile."""
+    return {
+        "version": version,
+        "status": "ready",
+        "ready": True,
+        "configurationDigest": "fixture",
+        "sourceId": source,
+        "sourceSha256": "a" * 64,
+        "artifactSha256": "b" * 64,
+        "profile": dict(FILLER_PROFILE),
+        "preparedAt": "2026-08-24T00:00:00Z",
+        "requestedSource": [source, "a" * 64],
+        **changes,
+    }
+
+
 class FakePipeline:
     def __init__(self, events, *, running=False, ready=True):
         self.events = events
@@ -202,7 +234,16 @@ class FakeCroccante:
         self.events.append(f"croccante:status:{version}")
         if self.status_answers:
             return self.status_answers.pop(0)
-        return 200, {"version": version, "status": "ready", "ready": True}
+        return 200, {
+            "version": version,
+            "status": "ready",
+            "ready": True,
+            "sourceId": "source-one",
+            "sourceSha256": "a" * 64,
+            "artifactSha256": "b" * 64,
+            "profile": dict(FILLER_PROFILE),
+            "preparedAt": "2026-08-24T00:00:00Z",
+        }
 
 
 class LifecycleTests(unittest.TestCase):
@@ -220,13 +261,9 @@ class LifecycleTests(unittest.TestCase):
             sleep=lambda _: None,
             ready_timeout=1,
             start_monitor=False,
+            live_profile=LIVE_PROFILE,
         )
-        self.manager.state["pendingFiller"] = {
-            "version": "filler-v1",
-            "status": "ready",
-            "ready": True,
-            "configurationDigest": "fixture",
-        }
+        self.manager.state["pendingFiller"] = ready_filler()
         self.manager._save()
 
     def tearDown(self):
@@ -346,7 +383,19 @@ class LifecycleTests(unittest.TestCase):
         self.manager.state["pendingFiller"] = None
         self.croccante.prepare_answers = [
             (502, {"version": "filler-v2", "status": "failed", "ready": False, "error": "unavailable-or-invalid-response"}),
-            (200, {"version": "filler-v2", "status": "ready", "ready": True}),
+            (
+                200,
+                {
+                    "version": "filler-v2",
+                    "status": "ready",
+                    "ready": True,
+                    "sourceId": "source-one",
+                    "sourceSha256": "a" * 64,
+                    "artifactSha256": "b" * 64,
+                    "profile": dict(FILLER_PROFILE),
+                    "preparedAt": "2026-08-24T00:00:00Z",
+                },
+            ),
         ]
         payload = self.filler_payload()
         first = self.manager.prepare_filler("filler-v2", "prepare-one", payload)
@@ -361,6 +410,7 @@ class LifecycleTests(unittest.TestCase):
             "status": "failed",
             "ready": False,
             "configurationDigest": "safe-digest",
+            "requestedSource": ["source-one", "a" * 64],
         }
         self.manager._save()
         recovered_events = []
@@ -369,6 +419,7 @@ class LifecycleTests(unittest.TestCase):
             FakePipeline(recovered_events),
             FakeCroccante(recovered_events),
             start_monitor=False,
+            live_profile=LIVE_PROFILE,
         )
         recovered.reconcile_once()
         self.assertEqual(recovered_events, ["croccante:status:filler-v2"])
@@ -436,6 +487,7 @@ class LifecycleTests(unittest.TestCase):
             sleep=lambda _: None,
             ready_timeout=1,
             start_monitor=False,
+            live_profile=LIVE_PROFILE,
         )
         recovered.reconcile_once()
         self.assertEqual(recovered_events, ["pipeline:start"])
@@ -451,6 +503,7 @@ class LifecycleTests(unittest.TestCase):
             FakePipeline(recovered_events, running=False),
             FakeCroccante(recovered_events),
             start_monitor=False,
+            live_profile=LIVE_PROFILE,
         )
         recovered.reconcile_once()
         self.assertEqual(recovered_events, ["croccante:stop"])
@@ -612,6 +665,7 @@ class LifecycleTests(unittest.TestCase):
             FakePipeline([], running=True),
             FakeCroccante([]),
             start_monitor=False,
+            live_profile=LIVE_PROFILE,
         )
         recovered.reconcile_once()
         self.assertEqual(recovered.view()["actualState"], "running")
@@ -642,6 +696,7 @@ class LifecycleTests(unittest.TestCase):
             FakePipeline(recovered_events, running=True),
             downstream,
             start_monitor=False,
+            live_profile=LIVE_PROFILE,
         )
         recovered.reconcile_once()
         self.assertEqual(recovered.view()["actualState"], "degraded")
@@ -849,13 +904,9 @@ class TapeTests(unittest.TestCase):
             sleep=lambda _: None,
             ready_timeout=1,
             start_monitor=False,
+            live_profile=LIVE_PROFILE,
         )
-        self.manager.state["pendingFiller"] = {
-            "version": "filler-v1",
-            "status": "ready",
-            "ready": True,
-            "configurationDigest": "fixture",
-        }
+        self.manager.state["pendingFiller"] = ready_filler()
         self.manager._save()
         self.recording = FakeRecording()
         self.tape = self.make_tape()
@@ -873,14 +924,6 @@ class TapeTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
-
-    def test_disabled_recorder_launches_nothing(self):
-        self.recording.state = {**self.recording.state, "enabled": False, "state": "disabled"}
-        status, payload = self.tape.command("start", "tape-1")
-        self.assertEqual(status, 409)
-        self.assertEqual(payload["commandResult"]["result"], "disabled")
-        self.assertEqual(self.events, [])
-        self.assertFalse(payload["tape"]["active"])
 
     def test_start_is_private_and_records(self):
         status, payload = self.tape.command("start", "tape-1")
@@ -1167,6 +1210,7 @@ class TapeControllerEdgeTests(unittest.TestCase):
             sleep=lambda _: None,
             ready_timeout=1,
             start_monitor=False,
+            live_profile=LIVE_PROFILE,
         )
         self.recording = FakeRecording()
         self.tape = control.TapeController(

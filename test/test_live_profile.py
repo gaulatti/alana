@@ -30,9 +30,8 @@ import test_startup_audio as startup
 control = base.control
 REPO = Path(__file__).resolve().parents[1]
 STARTUP = REPO / "startup.sh"
-ON = {"ALANA_LIVE_PROFILE": "on"}
 # The settings that make the live profile equal LifecycleTests.filler_payload()'s.
-MATCHING = {**ON, "AUDIO_BITRATE": "160k"}
+MATCHING = {"AUDIO_BITRATE": "160k"}
 DEFAULT_PROFILE = {
     "width": 1920,
     "height": 1080,
@@ -132,23 +131,12 @@ class EffectiveProfileTests(unittest.TestCase):
             hashlib.sha256(canonical.encode()).hexdigest(),
         )
 
-    def test_setting_is_on_by_default_and_strict(self):
-        self.assertTrue(control.live_profile_enabled({}))
-        self.assertTrue(control.live_profile_enabled({"ALANA_LIVE_PROFILE": ""}))
-        self.assertTrue(control.live_profile_enabled(ON))
-        # off stays the kill switch.
-        self.assertFalse(control.live_profile_enabled({"ALANA_LIVE_PROFILE": "off"}))
-        with self.assertRaises(ValueError):
-            control.live_profile_enabled({"ALANA_LIVE_PROFILE": "1"})
-
     def test_configured_document(self):
-        self.assertIsNone(control.configured_live_profile({"ALANA_LIVE_PROFILE": "off"}))
-        self.assertEqual(control.configured_live_profile({}), control.configured_live_profile(ON))
-        document = control.configured_live_profile(ON)
+        document = control.configured_live_profile({})
         self.assertEqual(document["profile"], DEFAULT_PROFILE)
         self.assertEqual(document["checksum"], control.profile_checksum(DEFAULT_PROFILE))
         self.assertEqual(
-            control.configured_live_profile({**ON, "GPU_TYPE": "NVIDIA"}),
+            control.configured_live_profile({"GPU_TYPE": "NVIDIA"}),
             {"profile": None, "checksum": None},
         )
 
@@ -295,7 +283,7 @@ class LifecycleFixture(unittest.TestCase):
 
 
 class BoundLifecycleTests(LifecycleFixture):
-    """The same fixture with ALANA_LIVE_PROFILE=on."""
+    """The lifecycle fixture, bound to the live profile."""
 
     def setUp(self):
         super().setUp()
@@ -379,7 +367,7 @@ class BoundLifecycleTests(LifecycleFixture):
         self.assertNotIn("yuv420p", output.getvalue())
 
     def test_unqualified_renderer_refuses_every_preparation(self):
-        manager = self.bound_manager(control.configured_live_profile({**ON, "GPU_TYPE": "NVIDIA"}))
+        manager = self.bound_manager(control.configured_live_profile({"GPU_TYPE": "NVIDIA"}))
         status, body = manager.prepare_filler("filler-v2", "prepare-one", self.filler_payload())
         self.assertEqual(status, 503)
         self.assertEqual(body["reason"], "invalid-profile")
@@ -427,7 +415,7 @@ class BoundLifecycleTests(LifecycleFixture):
     def test_changed_live_profile_after_restart_fails_start_closed(self):
         self.assertEqual(self.manager.prepare_filler("filler-v2", "prepare-one", self.filler_payload())[0], 200)
         recovered_events = []
-        changed = self.bound_manager(control.configured_live_profile(ON), events=recovered_events)
+        changed = self.bound_manager(control.configured_live_profile({}), events=recovered_events)
         pending = changed.view()["pendingFiller"]
         self.assertFalse(pending["ready"])
         self.assertEqual(pending["reason"], "profile-mismatch")
@@ -458,22 +446,6 @@ class BoundLifecycleTests(LifecycleFixture):
         payload = self.filler_payload()
         self.manager.prepare_filler("filler-v2", "prepare-one", payload)
         status, body = self.manager.prepare_filler("filler-v2", "prepare-one", payload)
-        self.assertEqual(status, 200)
-        self.assertTrue(body["duplicate"])
-        self.assertEqual(body["profileChecksum"], self.live["checksum"])
-        self.assertEqual(self.events.count("croccante:prepare:filler-v2"), 1)
-
-    def test_version_prepared_while_off_rebinds_on_replay(self):
-        payload = self.filler_payload()
-        off = control.LifecycleManager(
-            self.store, base.FakePipeline([]), self.croccante, sleep=lambda _: None, ready_timeout=1, start_monitor=False
-        )
-        self.assertEqual(off.prepare_filler("filler-v2", "prepare-one", payload)[0], 200)
-        self.assertNotIn("requestedSource", json.dumps(off.state))
-        bound = self.bound_manager(self.live)
-        # No recorded request source yet: not ready until the caller replays it.
-        self.assertFalse(bound.view()["pendingFiller"]["ready"])
-        status, body = bound.prepare_filler("filler-v2", "prepare-one", payload)
         self.assertEqual(status, 200)
         self.assertTrue(body["duplicate"])
         self.assertEqual(body["profileChecksum"], self.live["checksum"])
@@ -554,23 +526,6 @@ class BoundLifecycleTests(LifecycleFixture):
         self.assertEqual(self.manager.filler_status("filler-v8"), (404, {"version": "filler-v8", "status": "unprepared", "ready": False}))
 
 
-class OffPathTests(LifecycleFixture):
-    """With the setting off, nothing in the filler contract changes."""
-
-    def test_off_never_adds_a_checksum_or_refuses_a_profile(self):
-        self.manager.state["pendingFiller"] = None
-        payload = self.filler_payload()
-        payload["profile"]["audioBitrate"] = "1k"
-        status, body = self.manager.prepare_filler("filler-v2", "prepare-one", payload)
-        self.assertEqual(status, 200)
-        self.assertNotIn("profileChecksum", body)
-        self.assertNotIn("profileChecksum", json.dumps(self.manager.view()))
-        self.assertNotIn("requestedSource", json.dumps(self.manager.state))
-        self.manager.state["pendingFiller"]["profileChecksum"] = "d" * 64
-        self.assertNotIn("profileChecksum", json.dumps(self.manager.view()))
-        self.assertEqual(self.manager.live_profile_state(), "off")
-
-
 class MainWiringTests(unittest.TestCase):
     """main() builds the manager from the process environment, as in the image."""
 
@@ -616,23 +571,20 @@ class MainWiringTests(unittest.TestCase):
         self.assertTrue(control.MANAGER.closed.is_set())
         return control.MANAGER, output.getvalue()
 
-    def test_main_reads_the_setting_and_the_renderer_configuration(self):
-        manager, output = self.run_main({"ALANA_LIVE_PROFILE": "on", "RESOLUTION": "1280x720"})
+    def test_main_reads_the_renderer_configuration(self):
+        manager, output = self.run_main({"RESOLUTION": "1280x720"})
         self.assertEqual(manager.live_profile["profile"]["width"], 1280)
         self.assertEqual(manager.live_profile_state(), "published")
         self.assertIn("[control] live profile published", output)
-        manager, output = self.run_main({"ALANA_LIVE_PROFILE": "off"})
-        self.assertIsNone(manager.live_profile)
-        self.assertIn("[control] live profile off", output)
 
-    def test_unset_setting_serves_software_encoding_and_withholds_gpu_modes(self):
-        unset = ("ALANA_LIVE_PROFILE", "GPU_TYPE", "VIDEO_ENCODER")
+    def test_software_encoding_is_published_and_gpu_modes_are_withheld(self):
+        unset = ("GPU_TYPE", "VIDEO_ENCODER")
         manager, output = self.run_main({}, unset=unset)
         self.assertEqual(manager.live_profile["profile"], DEFAULT_PROFILE)
         self.assertIn("[control] live profile published", output)
         for gpu in ({"GPU_TYPE": "NVIDIA"}, {"GPU_TYPE": "INTEL"}, {"VIDEO_ENCODER": "h264_nvenc"}, {"VIDEO_ENCODER": "h264_vaapi"}):
             with self.subTest(gpu=gpu):
-                manager, output = self.run_main(gpu, unset=("ALANA_LIVE_PROFILE",))
+                manager, output = self.run_main(gpu)
                 self.assertEqual(manager.live_profile_state(), "unqualified")
                 self.assertIn("[control] live profile unqualified", output)
 
@@ -641,7 +593,9 @@ class LiveProfileMetricTests(unittest.TestCase):
     def test_state_gauge_and_binding_counter_stay_bounded(self):
         metrics = control.Metrics(Path(tempfile.gettempdir()) / "alana-live-profile-unused.json")
         rendered = metrics.render({"liveProfileState": "https://renderer.example/secret"})
-        self.assertIn('alana_live_profile_state{state="off"} 1', rendered)
+        # An unknown value is none of the bounded states and is never echoed.
+        self.assertIn('alana_live_profile_state{state="published"} 0', rendered)
+        self.assertIn('alana_live_profile_state{state="unqualified"} 0', rendered)
         self.assertNotIn("renderer.example", rendered)
         metrics.observe_profile_binding("start", "bound")
         self.assertIn(
@@ -697,7 +651,7 @@ class LiveProfileHttpTests(unittest.TestCase):
                 return error.code, error.read().decode()
 
     def test_published_profile_is_authenticated_program_scoped_and_self_consistent(self):
-        self.use(control.configured_live_profile(ON))
+        self.use(control.configured_live_profile({}))
         self.assertEqual(self.get(control.LIVE_PROFILE_PATH, token="")[0], 401)
         self.assertEqual(self.get(control.LIVE_PROFILE_PATH, token="wrong")[0], 401)
         self.assertEqual(self.get("/v1/programs/other-program/live-profile")[0], 404)
@@ -716,11 +670,10 @@ class LiveProfileHttpTests(unittest.TestCase):
         self.assertRegex(document["checksum"], r"^[0-9a-f]{64}$")
         _, metrics = self.get(control.METRICS_PATH)
         self.assertIn('alana_live_profile_state{state="published"} 1', metrics)
-        self.assertIn('alana_live_profile_state{state="off"} 0', metrics)
         self.assertIn('alana_http_requests_total{method="GET",route="live_profile",status_class="2xx"} 1', metrics)
         self.assertIn('alana_http_requests_total{method="GET",route="live_profile",status_class="4xx"} 3', metrics)
 
-    def test_unset_setting_answers_200_on_software_and_404_on_nvenc_and_vaapi(self):
+    def test_answers_200_on_software_and_404_on_nvenc_and_vaapi(self):
         self.use(control.configured_live_profile({}))
         status, text = self.get(control.LIVE_PROFILE_PATH)
         self.assertEqual(status, 200)
@@ -730,16 +683,11 @@ class LiveProfileHttpTests(unittest.TestCase):
                 self.use(control.configured_live_profile(gpu))
                 self.assertEqual(self.get(control.LIVE_PROFILE_PATH)[0], 404)
 
-    def test_off_and_unqualified_answer_404(self):
-        for live, state in (
-            (None, "off"),
-            (control.configured_live_profile({**ON, "VIDEO_ENCODER": "h264_vaapi"}), "unqualified"),
-        ):
-            with self.subTest(state=state):
-                self.use(live)
-                self.assertEqual(self.get(control.LIVE_PROFILE_PATH)[0], 404)
-                _, metrics = self.get(control.METRICS_PATH)
-                self.assertIn(f'alana_live_profile_state{{state="{state}"}} 1', metrics)
+    def test_unqualified_answers_404(self):
+        self.use(control.configured_live_profile({"VIDEO_ENCODER": "h264_vaapi"}))
+        self.assertEqual(self.get(control.LIVE_PROFILE_PATH)[0], 404)
+        _, metrics = self.get(control.METRICS_PATH)
+        self.assertIn('alana_live_profile_state{state="unqualified"} 1', metrics)
 
     def test_bound_preparation_over_http_carries_the_checksum(self):
         live = control.configured_live_profile(MATCHING)

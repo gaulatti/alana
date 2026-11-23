@@ -74,7 +74,7 @@ def one_run(image: str, seconds: int, work: Path, index: int, platform: str, kee
         ["docker", "run", "-d", "--name", name, "--platform", platform, "--shm-size", "1g",
          "-p", "127.0.0.1::8080",
          "-e", f"PROGRAM_ID={PROGRAM}", "-e", f"CHANNEL_BROWSER_URL=http://127.0.0.1:{PAGE_PORT}/page.html",
-         "-e", "RECORDING_ENABLED=1", "-e", "CROCCANTE_CONTROL_URL=http://127.0.0.1:9",
+         "-e", "CROCCANTE_CONTROL_URL=http://127.0.0.1:9",
          # Start-up validation needs an output; tape mode never publishes to it.
          "-e", "RTMP_OUTPUTS=rtmp://127.0.0.1:1935/live/drift-unused",
          # The rest as docker-compose.yml sets them.

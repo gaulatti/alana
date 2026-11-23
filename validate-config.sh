@@ -55,17 +55,6 @@ chain_error=$(python3 "$(dirname "${BASH_SOURCE[0]}")/audio_chain.py" filter 1:a
     || fail "${chain_error:-processed audio settings are invalid}"
 unset chain_error
 
-# Effective live profile (gaulatti/alana#29), on by default; off is the kill switch.
-case "${ALANA_LIVE_PROFILE:-on}" in
-    on|off) ;;
-    *) fail "ALANA_LIVE_PROFILE must be on or off" ;;
-esac
-
-case "${RECORDING_ENABLED:-0}" in
-    0|1) ;;
-    *) fail "RECORDING_ENABLED must be 0 or 1" ;;
-esac
-
 for setting in RECORDING_SEGMENT_SECONDS:5 RECORDING_QUOTA_BYTES:53687091200 \
     RECORDING_MIN_FREE_BYTES:1073741824 RECORDING_RETENTION_HOURS:168 \
     RECORDING_MAX_RESTARTS:5 RECORDING_RESTART_BACKOFF_SECONDS:2 \
