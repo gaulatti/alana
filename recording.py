@@ -69,6 +69,7 @@ PUBLIC_FIELDS = frozenset(
         "restarts",
         "finalizationState",
         "finalizationMethod",
+        "fallbackSegments",
         "finalSha256",
         "finalBytes",
         "error",
@@ -738,21 +739,45 @@ def segment_audio_timing(path: Path) -> tuple[float, float]:
     return first, len(packets) * AAC_FRAME_SAMPLES / rate
 
 
-def audio_anchored_durations(timings: list[tuple[float, float]]) -> list[float]:
+def audio_anchored_durations(
+    timings: list[tuple[float, float] | None],
+) -> tuple[list[float | None], int]:
     """Concat durations that start each segment where the previous one's audio ends.
 
     A segment placed at offset O starts its audio at O + first; the next segment
     must start its audio at O + first + length, so it is placed at
     O + first + length - next_first. The positions telescope, so rounding in one
     segment's first timestamp never accumulates. The last segment needs none.
+
+    A segment whose audio cannot be measured (None), or whose audio does not
+    continue into the next, gets None: the concat demuxer then places what follows
+    by that segment's container duration, as before #32, and only that one
+    placement can drift (#38). A measured segment followed by an unmeasured one
+    ends at its own audio end, the next segment's lead (a few ms) being unknown.
+    Returns the durations and how many segments fell back.
     """
-    durations = []
-    for (first, length), (next_first, _) in zip(timings, timings[1:]):
-        duration = first + length - next_first
+    durations: list[float | None] = []
+    fallbacks = sum(1 for timing in timings if timing is None)
+    for timing, following in zip(timings, timings[1:]):
+        if timing is None:
+            durations.append(None)
+            continue
+        first, length = timing
+        duration = first + length - (following[0] if following is not None else 0.0)
         if not math.isfinite(duration) or duration <= 0:
-            raise ValueError("segment audio does not continue")
+            durations.append(None)
+            fallbacks += 1
+            continue
         durations.append(duration)
-    return durations
+    return durations, fallbacks
+
+
+def measured_audio_timing(path: Path) -> tuple[float, float] | None:
+    """The segment's audio timing, or None when it cannot be measured."""
+    try:
+        return segment_audio_timing(path)
+    except (OSError, ValueError, subprocess.SubprocessError, json.JSONDecodeError):
+        return None
 
 
 def finalize_recording(store: RecordingStore, state: dict[str, object]) -> bool:
@@ -772,20 +797,18 @@ def finalize_recording(store: RecordingStore, state: dict[str, object]) -> bool:
                 raise ValueError("segment checksum mismatch")
             segments.append(segment)
         # Exact: each segment starts where the previous one's audio ended, by
-        # sample count (#32). A recording is never refused for this: if any
-        # segment's audio cannot be measured, join by container duration as
-        # before, which drifts but keeps every segment.
-        try:
-            spans: list[float] | None = audio_anchored_durations([segment_audio_timing(segment) for segment in segments])
-            state["finalizationMethod"] = "exact"
-        except (OSError, ValueError, subprocess.SubprocessError, json.JSONDecodeError):
-            spans = None
-            state["finalizationMethod"] = "fallback"
-            log_event("finalize", "finalizing", "span-unavailable", len(segments))
+        # sample count (#32). A recording is never refused for this: a segment
+        # whose audio cannot be anchored is placed by its container duration, as
+        # before, and every other segment keeps its anchor (#38).
+        spans, fallbacks = audio_anchored_durations([measured_audio_timing(segment) for segment in segments])
+        state["finalizationMethod"] = "fallback" if fallbacks else "exact"
+        state["fallbackSegments"] = fallbacks
+        if fallbacks:
+            log_event("finalize", "finalizing", "span-unavailable", fallbacks)
         with concat_path.open("w", encoding="utf-8") as output:
             for index, segment in enumerate(segments):
                 output.write(f"file '{segment.name}'\n")
-                if spans is not None and index < len(spans):
+                if index < len(spans) and spans[index] is not None:
                     output.write(f"duration {spans[index]:.6f}\n")
             output.flush()
             os.fsync(output.fileno())
