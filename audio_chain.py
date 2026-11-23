@@ -72,13 +72,25 @@ def filter_graph(source: str, output: str, target: float, ceiling: float) -> str
     threshold = 10 ** ((target - THRESHOLD_BELOW_TARGET_DB) / 20)
     makeup = 10 ** (MAKEUP_DB / 20)
     limit = 10 ** ((ceiling - OVERSAMPLED_MARGIN_DB) / 20)
+    # Every encoder keeps its inputs on their shared wall clock (-copyts, #30), so
+    # audio arrives with epoch-sized timestamps. ffmpeg 5.1's sidechaincompress
+    # restarts its output at 0 whatever its input says, and the 4x aresample
+    # overflows its timestamp arithmetic above about 1e9 s; either moved audio
+    # against video (#34). So the processing runs on a copy rebased to 0, and the
+    # result is put back on the input's own timeline by mixing it with a muted
+    # copy of the input: amix takes its timestamps from its first input and its
+    # samples, in order, from both.
     return (
-        f"[{source}]aresample={SAMPLE_RATE},asplit=2[program][key];"
+        f"[{source}]aresample={SAMPLE_RATE},asplit=2[timeline][work];"
+        "[work]asetpts=PTS-STARTPTS,asplit=2[program][key];"
         f"[key]{K_WEIGHTING}[weighted];"
         f"[program][weighted]sidechaincompress=threshold={threshold:.6f}:ratio=20:attack=800:release=4000:"
         f"makeup={makeup:.6f}:knee=2:detection=rms:link=average,"
         f"aresample={SAMPLE_RATE * 4},alimiter=limit={limit:.6f}:attack=5:release=50:level=disabled,"
-        f"aresample={SAMPLE_RATE},asplit=2[{output}][meter];"
+        f"aresample={SAMPLE_RATE}[processed];"
+        "[timeline]volume=0[carrier];"
+        "[carrier][processed]amix=inputs=2:normalize=0:duration=first:dropout_transition=0,"
+        f"asplit=2[{output}][meter];"
         "[meter]ebur128=peak=true:metadata=1,ametadata=mode=print:file=/dev/stderr,anullsink"
     )
 

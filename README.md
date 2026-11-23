@@ -114,6 +114,14 @@ copy of the programme, a 4x-oversampled limiter 0.5 dB under the ceiling, and an
 ebur128 meter on a side branch. With the switch on, RTMP audio is 48 kHz instead
 of 44.1 kHz. Only new recordings are processed; existing archives are unchanged.
 
+Every encoder keeps its inputs on their shared wall clock (`-copyts`), so the
+chain sees epoch-sized timestamps. ffmpeg 5.1's `sidechaincompress` restarts its
+output at 0, and the 4x resampler overflows above about 1e9 s; either put audio
+at 0 against wall-clock video, which stalled the RTMP encoder and the recorder.
+So the processing runs on a copy rebased to 0, and the result is put back on the
+input's own timeline by mixing it with a muted copy of the input (`amix` takes
+its timestamps from its first input).
+
 Encoders still run with `-loglevel quiet`; the meter writes only ebur128 frame
 metadata to stderr, which `alana_metrics.py loudness-monitor` turns into one
 file per output under `/run/alana/loudness/` (written at most once a second).
