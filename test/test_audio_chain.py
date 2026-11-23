@@ -63,7 +63,10 @@ class AudioChainSettingsTests(unittest.TestCase):
         self.assertIn("sidechaincompress=threshold=0.025119:", graph)
         self.assertIn("makeup=5.623413:", graph)
         self.assertIn("alimiter=limit=0.841395:", graph)
-        self.assertIn("aresample=48000,asplit=2[aout][meter];", graph)
+        # Processed on a copy rebased to 0, then put back on the input's timeline (#34).
+        self.assertIn("[1:a:0]aresample=48000,asplit=2[timeline][work];[work]asetpts=PTS-STARTPTS,asplit=2[program][key];", graph)
+        self.assertIn("aresample=48000[processed];[timeline]volume=0[carrier];", graph)
+        self.assertIn("[carrier][processed]amix=inputs=2:normalize=0:duration=first:dropout_transition=0,asplit=2[aout][meter];", graph)
         self.assertTrue(graph.endswith("[meter]ebur128=peak=true:metadata=1,ametadata=mode=print:file=/dev/stderr,anullsink"))
 
     def test_command_prints_the_configured_graph_and_rejects_bad_use(self):
@@ -154,6 +157,36 @@ class AudioChainMeasurementTests(unittest.TestCase):
                 samples = array("h", handle.readframes(handle.getnframes()))
         onset = next(index for index in range(0, len(samples), 2) if abs(samples[index]) > 300) // 2
         self.assertLessEqual((onset - 48000) * 1000 / 48000, 10.0)
+
+    def test_chain_keeps_the_input_timeline_and_its_samples_in_place(self):
+        """Every encoder keeps its inputs on their shared wall clock (-copyts, #30), so
+        the chain sees epoch-sized timestamps, and audio that opened after video starts
+        later than 0. Both must come out as they went in (#34): before, ffmpeg 5.1's
+        sidechaincompress restarted at 0 and the 4x resampler overflowed at epoch size,
+        so the encoder placed audio ahead of video."""
+        burst = "if(between(t\\,1\\,1.05)\\,0.1*sin(2*PI*1000*t)\\,0)"
+        for start in (2.5, 1795431700.0):
+            with self.subTest(start=start), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "timeline.mkv"
+                subprocess.run(
+                    [FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-copyts", "-f", "lavfi",
+                     "-i", f"aevalsrc={burst}|{burst}:s=44100:d=3,asetpts=PTS+{start}/TB",
+                     "-filter_complex", audio_chain.filter_graph("0:a", "out", -16.0, -1.0), "-map", "[out]",
+                     "-c:a", "pcm_s16le", "-f", "matroska", str(output)],
+                    check=True,
+                    capture_output=True,
+                )
+                probed = subprocess.run(
+                    [shutil.which("ffprobe") or "ffprobe", "-v", "error", "-show_entries", "stream=start_time", "-of", "csv=p=0", str(output)],
+                    capture_output=True, text=True, check=True,
+                ).stdout
+                self.assertAlmostEqual(float(probed), start, delta=0.002)
+                pcm = Path(directory) / "timeline.wav"
+                subprocess.run([FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-i", str(output), str(pcm)], check=True)
+                with wave.open(str(pcm)) as handle:
+                    samples = array("h", handle.readframes(handle.getnframes()))
+                onset = next(index for index in range(0, len(samples), 2) if abs(samples[index]) > 300) // 2
+                self.assertLessEqual(abs(onset - 48000) * 1000 / 48000, 10.0, f"burst {onset / 48:.1f} ms into the output")
 
 
 if __name__ == "__main__":
