@@ -199,6 +199,109 @@ class RecordingContractTests(unittest.TestCase):
         finally:
             controller.close()
 
+    def _save_state(self, state: str, operation_id: str = "c" * 16, **extra):
+        store = RecordingStore(self.root)
+        store.operation_dir(operation_id).mkdir(exist_ok=True)
+        store.save(
+            {
+                "enabled": True,
+                "state": state,
+                "operationId": operation_id,
+                "segmentCount": 0,
+                "bytes": 0,
+                "durationSeconds": 0.0,
+                "droppedFrames": 0,
+                "errors": 0,
+                "restarts": 0,
+                "finalizationState": "not-requested",
+                **extra,
+            }
+        )
+        return store
+
+    def test_supervisor_polls_a_running_capture_then_exhausts_restarts(self):
+        operation_id = "d" * 16
+        store = self._save_state("requested", operation_id, restarts=5)
+        process = Mock()
+        process.pid = 321
+        process.poll.side_effect = [None, 1, 1]
+        environment = {
+            "PULSE_SERVER": "test",
+            "RECORDING_QUOTA_BYTES": str(2**63 - 1),
+            "RECORDING_MIN_FREE_BYTES": "1",
+            "RECORDING_MAX_RESTARTS": "5",
+        }
+        with (
+            patch.dict(os.environ, environment, clear=False),
+            patch("recording.start_capture", return_value=process),
+        ):
+            result = run_supervisor(self.root, operation_id)
+
+        state = store.load()
+        self.assertEqual(result, 1)
+        self.assertEqual(state["state"], "failed")
+        self.assertEqual(state["error"], "restart-exhausted")
+        self.assertEqual(state["restarts"], 6)
+
+    def test_stop_of_a_finished_recording_reports_its_state(self):
+        self._save_state("complete")
+        controller = RecordingController(self.root, ready=lambda: True, start_monitor=False)
+        try:
+            status, state = controller.stop("stop-complete")
+            self.assertEqual(status, 200)
+            self.assertEqual(state["commandResult"]["result"], "complete")
+        finally:
+            controller.close()
+
+    def test_stop_waits_for_finalization_to_complete(self):
+        store = self._save_state("active")
+        controller = RecordingController(self.root, ready=lambda: True, start_monitor=False)
+
+        def finish():
+            state = store.load()
+            state.update(state="complete", finalizationState="verified")
+            store.save(state)
+
+        try:
+            with patch.object(controller, "_spawn", side_effect=finish):
+                status, state = controller.stop("stop-active")
+            self.assertEqual(status, 200)
+            self.assertEqual(state["state"], "complete")
+        finally:
+            controller.close()
+
+    def test_a_controller_with_nothing_to_record_does_not_spawn_a_supervisor(self):
+        self._save_state("idle")
+        controller = RecordingController(self.root, ready=lambda: True, start_monitor=False)
+        try:
+            with patch("recording.subprocess.Popen") as popen:
+                controller._spawn()
+            popen.assert_not_called()
+            self.assertIsNone(controller.process)
+        finally:
+            controller.close()
+
+    def test_the_monitor_reads_the_state_each_second_until_closed(self):
+        self._save_state("idle")
+        controller = RecordingController(self.root, ready=lambda: True, start_monitor=False)
+        try:
+            with patch.object(controller.closed, "wait", side_effect=[False, True]) as wait:
+                controller._monitor()
+            self.assertEqual(wait.call_count, 2)
+        finally:
+            controller.close()
+
+    def test_synthetic_smoke_reports_the_finalized_recording(self):
+        completed = Mock(returncode=0)
+        with (
+            patch("recording.capture_environment", return_value={}),
+            patch("recording.subprocess.run", return_value=completed),
+            patch("recording.harvest_segments", return_value=[]),
+            patch("recording.finalize_recording", return_value=True),
+        ):
+            state = synthetic_smoke(self.root, 1, 1)
+        self.assertEqual(state["state"], "active")
+
     def test_corrupt_state_fails_closed_instead_of_resetting(self):
         store = RecordingStore(self.root)
         store.state_file.write_text("{not-json", encoding="utf-8")
