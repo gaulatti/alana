@@ -1632,7 +1632,8 @@ class LifecycleManager:
                     )
                     self._save()
                     return
-            if self.pipeline.running():
+            # A private tape keeps the pipeline running until TapeController stops it (gaulatti/alana#33).
+            if self.pipeline.running() and not self.pipeline.tape:
                 self.pipeline.stop()
             active_filler = self.state.get("activeFiller")
             pending_filler = self.state.get("pendingFiller")
