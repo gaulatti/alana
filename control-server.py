@@ -105,14 +105,6 @@ def profile_checksum(profile: dict[str, object]) -> str:
     ).hexdigest()
 
 
-def live_profile_enabled(environ: Mapping[str, str] = os.environ) -> bool:
-    """``ALANA_LIVE_PROFILE``: on by default (publish and bind); off is the kill switch."""
-    value = environ.get("ALANA_LIVE_PROFILE", "") or "on"
-    if value not in ("on", "off"):
-        raise ValueError("ALANA_LIVE_PROFILE must be on or off")
-    return value == "on"
-
-
 def effective_live_profile(
     environ: Mapping[str, str] = os.environ,
 ) -> dict[str, object] | None:
@@ -159,13 +151,11 @@ def effective_live_profile(
 
 def configured_live_profile(
     environ: Mapping[str, str] = os.environ,
-) -> dict[str, object] | None:
-    """The live-profile document, or None under the ALANA_LIVE_PROFILE=off kill switch.
+) -> dict[str, object]:
+    """The live-profile document.
 
-    With the setting on and an unqualified configuration, ``profile`` is None:
-    nothing is published and no filler can become ready."""
-    if not live_profile_enabled(environ):
-        return None
+    With an unqualified configuration, ``profile`` is None: nothing is
+    published and no filler can become ready."""
     profile = effective_live_profile(environ)
     return {
         "profile": profile,
@@ -871,12 +861,11 @@ class LifecycleManager:
         monotonic: Callable[[], float] = time.monotonic,
         ready_timeout: int = PIPELINE_READY_TIMEOUT,
         start_monitor: bool = True,
-        live_profile: dict[str, object] | None = None,
+        live_profile: dict[str, object],
     ):
         self.store = store
         self.pipeline = pipeline
         self.croccante = croccante
-        # None only with the ALANA_LIVE_PROFILE=off kill switch: every filler path is then as before #29.
         self.live_profile = live_profile
         self.sleep = sleep
         self.monotonic = monotonic
@@ -947,13 +936,11 @@ class LifecycleManager:
             "preparedAt",
             "reason",
             "error",
-            *(("profileChecksum",) if self.live_profile is not None else ()),
+            "profileChecksum",
         }
         return {key: item for key, item in value.items() if key in allowed}
 
     def live_profile_state(self) -> str:
-        if self.live_profile is None:
-            return "off"
         return "unqualified" if self.live_profile.get("profile") is None else "published"
 
     @staticmethod
@@ -970,9 +957,9 @@ class LifecycleManager:
 
         Ready only when Croccante acknowledged the complete profile, its
         checksum equals the effective live profile's, and the source identity
-        equals the request. Anything else is a bounded failure. With the
-        setting off, or a filler that is not ready, nothing changes."""
-        if self.live_profile is None or not isinstance(filler, dict) or filler.get("ready") is not True:
+        equals the request. Anything else is a bounded failure. A filler that
+        is not ready is left as it is."""
+        if not isinstance(filler, dict) or filler.get("ready") is not True:
             return filler, "not_bound"
         live = self.live_profile.get("checksum")
         profile = filler.get("profile")
@@ -1098,13 +1085,11 @@ class LifecycleManager:
         payload: dict[str, object],
     ) -> tuple[int, dict[str, object]]:
         digest = self._filler_digest(payload)
-        bound: dict[str, object] = {}
-        if self.live_profile is not None:
-            refusal = self._refuse_unbindable(version, payload)
-            if refusal is not None:
-                return refusal
-            source = payload.get("source") if isinstance(payload.get("source"), dict) else {}
-            bound = {"requestedSource": [source.get("id"), source.get("sha256")]}
+        refusal = self._refuse_unbindable(version, payload)
+        if refusal is not None:
+            return refusal
+        source = payload.get("source") if isinstance(payload.get("source"), dict) else {}
+        bound: dict[str, object] = {"requestedSource": [source.get("id"), source.get("sha256")]}
         with self.preparation_lock:
             with self.lock:
                 for slot in ("activeFiller", "pendingFiller"):
@@ -1120,12 +1105,11 @@ class LifecycleManager:
                             "reason": "version-conflict",
                         }
                     if existing.get("ready") is True:
-                        if self.live_profile is not None:
-                            existing, binding = self._bind({**existing, **bound})
-                            METRICS.observe_profile_binding("prepare", binding)
-                            if slot == "pendingFiller":
-                                self.state[slot] = existing
-                                self._save()
+                        existing, binding = self._bind({**existing, **bound})
+                        METRICS.observe_profile_binding("prepare", binding)
+                        if slot == "pendingFiller":
+                            self.state[slot] = existing
+                            self._save()
                         if existing.get("ready") is True:
                             METRICS.observe_preparation("duplicate")
                             return 200, {**(self._public_filler(existing) or {}), "duplicate": True}
@@ -1150,12 +1134,11 @@ class LifecycleManager:
                     "configurationDigest": digest,
                     **bound,
                 }
-                if self.live_profile is not None:
-                    filler, binding = self._bind(filler)
-                    if binding != "not_bound":
-                        METRICS.observe_profile_binding("prepare", binding)
-                    if status < 300 and filler.get("ready") is not True:
-                        status = 409
+                filler, binding = self._bind(filler)
+                if binding != "not_bound":
+                    METRICS.observe_profile_binding("prepare", binding)
+                if status < 300 and filler.get("ready") is not True:
+                    status = 409
                 self.state["pendingFiller"] = filler
                 self._save()
                 if status < 300 and filler.get("ready") is True:
@@ -1174,7 +1157,7 @@ class LifecycleManager:
     ) -> tuple[int, dict[str, object]] | None:
         """Refuse, before any state or downstream change, a preparation that can
         never bind: no qualified live profile, or a caller profile that differs."""
-        live = self.live_profile.get("profile") if self.live_profile else None
+        live = self.live_profile.get("profile")
         requested = payload.get("profile")
         if live is None:
             METRICS.observe_profile_binding("prepare", "unavailable")
@@ -1198,21 +1181,19 @@ class LifecycleManager:
                 existing = self.state.get(slot)
                 if isinstance(existing, dict) and existing.get("version") == version:
                     refreshed = {**result, **self._internal(existing)}
-                    if self.live_profile is not None:
-                        refreshed, binding = self._bind(refreshed)
-                        if binding != "not_bound":
-                            METRICS.observe_profile_binding("status", binding)
-                        public = refreshed
+                    refreshed, binding = self._bind(refreshed)
+                    if binding != "not_bound":
+                        METRICS.observe_profile_binding("status", binding)
+                    public = refreshed
                     self.state[slot] = refreshed
             self._save()
-        if self.live_profile is not None:
-            if public is result:
-                # A version Alana holds no request for can never prove its source.
-                public, binding = self._bind(result)
-                if binding != "not_bound":
-                    METRICS.observe_profile_binding("status", binding)
-            if status < 300 and public.get("ready") is not True:
-                status = 409
+        if public is result:
+            # A version Alana holds no request for can never prove its source.
+            public, binding = self._bind(result)
+            if binding != "not_bound":
+                METRICS.observe_profile_binding("status", binding)
+        if status < 300 and public.get("ready") is not True:
+            status = 409
         return status, self._public_filler(public) or {}
 
     def _set_transition(self, requested: str, actual: str, transition: str) -> None:
@@ -1401,11 +1382,10 @@ class LifecycleManager:
             )
 
         pending_filler = self.state.get("pendingFiller")
-        if self.live_profile is not None:
-            # A stale or changed live profile fails closed here, before any side effect.
-            pending_filler, binding = self._bind(pending_filler)
-            if binding != "not_bound":
-                METRICS.observe_profile_binding("start", binding)
+        # A stale or changed live profile fails closed here, before any side effect.
+        pending_filler, binding = self._bind(pending_filler)
+        if binding != "not_bound":
+            METRICS.observe_profile_binding("start", binding)
         if not isinstance(pending_filler, dict) or pending_filler.get("ready") is not True:
             return self._finish_command(
                 key, "start", sequence, "filler-not-ready", 409, destination
@@ -1531,10 +1511,9 @@ class LifecycleManager:
                 if FILLER_IDENTIFIER.fullmatch(version):
                     status, result = self.croccante.filler_status(version)
                     refreshed = {**result, **self._internal(pending_filler)}
-                    if self.live_profile is not None:
-                        refreshed, binding = self._bind(refreshed)
-                        if binding != "not_bound":
-                            METRICS.observe_profile_binding("reconcile", binding)
+                    refreshed, binding = self._bind(refreshed)
+                    if binding != "not_bound":
+                        METRICS.observe_profile_binding("reconcile", binding)
                     self.state["pendingFiller"] = refreshed
                     METRICS.observe_preparation(
                         "reconciled" if status < 300 and refreshed.get("ready") is True else "not_ready"
@@ -1740,7 +1719,7 @@ class TapeController:
             self._save()
         return {
             "tape": {
-                "enabled": bool(recording.get("enabled")),
+                "enabled": True,
                 "active": self.active,
                 "pipelineHealthy": bool(self.active and manager.pipeline.ready()),
             },
@@ -1780,8 +1759,6 @@ class TapeController:
 
     def _start_locked(self, key: str) -> tuple[int, dict[str, object]]:
         manager = self.get_manager()
-        if not self.get_recorder().status().get("enabled"):
-            return self._record(key, "start", 409, "disabled")
         with manager.lock:
             if self.active:
                 return self._record(key, "start", 409, "already-active")
@@ -2023,8 +2000,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == LIVE_PROFILE_PATH:
                 document = manager().live_profile
-                if document is None or document.get("profile") is None:
-                    # Off, or a configuration Alana cannot vouch for: absent, never guessed.
+                if document.get("profile") is None:
+                    # A configuration Alana cannot vouch for: absent, never guessed.
                     self.send_json(404, {"error": "not found"})
                     return
                 self.send_json(
@@ -2239,7 +2216,6 @@ def main() -> None:
     )
     RECORDER = RecordingController(
         STATE_DIR / "recordings",
-        enabled=os.environ.get("RECORDING_ENABLED", "0") == "1",
         ready=lambda: manager().pipeline.ready(),
     )
     TAPE = TapeController(

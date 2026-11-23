@@ -41,7 +41,7 @@ PROFILE_BINDING_OPERATIONS = frozenset({"prepare", "status", "reconcile", "start
 PROFILE_BINDING_RESULTS = frozenset(
     {"bound", "caller_mismatch", "profile_mismatch", "source_mismatch", "unavailable"}
 )
-LIVE_PROFILE_STATES = ("off", "published", "unqualified")
+LIVE_PROFILE_STATES = ("published", "unqualified")
 DESTINATION_ACTIONS = frozenset({"reload"})
 DESTINATION_RESULTS = frozenset(
     {"success", "failure", "conflict", "duplicate", "active"}
@@ -52,7 +52,6 @@ UNRECOGNIZED_BOUNDARIES = frozenset(
 )
 UNRECOGNIZED_KINDS = frozenset({"unknown_field", "unknown_value", "unexpected_body"})
 RECORDING_STATES = (
-    "disabled",
     "idle",
     "requested",
     "active",
@@ -421,8 +420,8 @@ class Metrics:
             "Whether the configured next-session filler version is acknowledged ready.",
             int(isinstance(pending_filler, dict) and pending_filler.get("ready") is True),
         )
-        live_profile_state = str(snapshot.get("liveProfileState") or "off")
-        live_profile_state = live_profile_state if live_profile_state in LIVE_PROFILE_STATES else "off"
+        # An absent or unknown state reads as none of the two: nothing is invented for it.
+        live_profile_state = str(snapshot.get("liveProfileState") or "")
         for state in LIVE_PROFILE_STATES:
             self._gauge(
                 lines,
@@ -455,12 +454,6 @@ class Metrics:
         recording_state = str(recording.get("state") or "unknown")
         if recording_state not in RECORDING_STATES:
             recording_state = "unknown"
-        self._gauge(
-            lines,
-            "alana_recording_enabled",
-            "Whether the opt-in composed-program recorder is enabled.",
-            int(bool(recording.get("enabled"))),
-        )
         for state in RECORDING_STATES:
             self._gauge(
                 lines,

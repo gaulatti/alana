@@ -27,7 +27,7 @@ import audio_chain
 from alana_metrics import monitor_loudness
 
 RECORDING_STATES = frozenset(
-    {"disabled", "idle", "requested", "active", "finalizing", "complete", "failed"}
+    {"idle", "requested", "active", "finalizing", "complete", "failed"}
 )
 FINALIZATION_STATES = frozenset({"not-requested", "pending", "verified", "failed"})
 FAILURE_REASONS = frozenset(
@@ -183,13 +183,13 @@ class RecordingStore:
             raise ValueError("invalid recording operation")
         return self.operations_dir / operation_id
 
-    def load(self, *, enabled: bool = True) -> dict[str, object]:
+    def load(self) -> dict[str, object]:
         state = read_json(self.state_file)
         if state is None:
             stamp = now()
             if self.state_file.exists():
                 state = {
-                    "enabled": enabled,
+                    "enabled": True,
                     "state": "failed",
                     "operationId": None,
                     "segmentCount": 0,
@@ -204,8 +204,8 @@ class RecordingStore:
                 }
             else:
                 state = {
-                    "enabled": enabled,
-                    "state": "idle" if enabled else "disabled",
+                    "enabled": True,
+                    "state": "idle",
                     "operationId": None,
                     "segmentCount": 0,
                     "bytes": 0,
@@ -220,9 +220,8 @@ class RecordingStore:
         if state.get("state") not in RECORDING_STATES:
             state["state"] = "failed"
             state["error"] = "manifest-corrupt"
-        state["enabled"] = enabled
-        if not enabled:
-            state["state"] = "disabled"
+        # Recording is always available; Alcantara's panel reads this constant field.
+        state["enabled"] = True
         return state
 
     @contextmanager
@@ -857,7 +856,7 @@ def finalize_recording(store: RecordingStore, state: dict[str, object]) -> bool:
 
 def run_supervisor(root: Path, operation_id: str, *, synthetic: bool = False) -> int:
     store = RecordingStore(root)
-    state = store.load(enabled=True)
+    state = store.load()
     if state.get("operationId") != operation_id or state.get("state") not in {
         "requested",
         "active",
@@ -927,7 +926,7 @@ def run_supervisor(root: Path, operation_id: str, *, synthetic: bool = False) ->
         log_event("capture", "active", "started", int(state.get("restarts", 0)))
         disk_failure: str | None = None
         while process.poll() is None and not shutdown.wait(0.25):
-            current = store.load(enabled=True)
+            current = store.load()
             if current.get("operationId") != operation_id:
                 shutdown.set()
                 break
@@ -961,7 +960,7 @@ def run_supervisor(root: Path, operation_id: str, *, synthetic: bool = False) ->
 
         if process.poll() is None:
             terminate_process(process)
-        state = store.load(enabled=True)
+        state = store.load()
         dropped_base = max(
             int(state.get("droppedFrames", 0)),
             dropped_base + read_dropped_frames(progress),
@@ -983,7 +982,7 @@ def run_supervisor(root: Path, operation_id: str, *, synthetic: bool = False) ->
             return 1
         state["workerPid"] = None
         store.save_active_progress(state)
-        current = store.load(enabled=True)
+        current = store.load()
         if current.get("state") == "finalizing":
             current["stoppedAt"] = current.get("stoppedAt") or now()
             return 0 if finalize_recording(store, current) else 1
@@ -1026,34 +1025,31 @@ class RecordingController:
         self,
         root: Path,
         *,
-        enabled: bool,
         ready: Callable[[], bool],
         synthetic: bool = False,
         start_monitor: bool = True,
     ):
         self.store = RecordingStore(root)
-        self.enabled = enabled
         self.ready = ready
         self.synthetic = synthetic
         self.process: subprocess.Popen[bytes] | None = None
         self.lock = threading.RLock()
         self.closed = threading.Event()
-        state = self.store.load(enabled=enabled)
-        if enabled:
-            cleanup_retention(
-                self.store,
-                parse_positive("RECORDING_RETENTION_HOURS", 168),
-                str(state.get("operationId") or "") or None,
-            )
+        state = self.store.load()
+        cleanup_retention(
+            self.store,
+            parse_positive("RECORDING_RETENTION_HOURS", 168),
+            str(state.get("operationId") or "") or None,
+        )
         if start_monitor:
             threading.Thread(target=self._monitor, daemon=True).start()
 
     def status(self) -> dict[str, object]:
-        return self.store.public(self.store.load(enabled=self.enabled))
+        return self.store.public(self.store.load())
 
     def _spawn(self) -> None:
-        state = self.store.load(enabled=self.enabled)
-        if not self.enabled or state.get("state") not in {"requested", "active", "finalizing"}:
+        state = self.store.load()
+        if state.get("state") not in {"requested", "active", "finalizing"}:
             return
         if state.get("state") in {"requested", "active"} and not self.ready():
             return
@@ -1100,9 +1096,7 @@ class RecordingController:
             prior = self._prior(key, "start")
             if prior:
                 return prior
-            state = self.store.load(enabled=self.enabled)
-            if not self.enabled:
-                return self._record(key, "start", 409, "disabled")
+            state = self.store.load()
             if state.get("error") == "manifest-corrupt":
                 return self._record(key, "start", 500, "manifest-corrupt")
             if state.get("state") in {"requested", "active", "finalizing"}:
@@ -1152,11 +1146,11 @@ class RecordingController:
             timeout = parse_positive("RECORDING_START_TIMEOUT", 10)
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
-                current = self.store.load(enabled=True)
+                current = self.store.load()
                 if current.get("state") in {"active", "failed"}:
                     break
                 time.sleep(0.05)
-            current = self.store.load(enabled=True)
+            current = self.store.load()
             if current.get("state") == "failed":
                 return self._record(key, "start", 503, str(current.get("error") or "capture-failed"))
             return self._record(key, "start", 202, "accepted")
@@ -1166,9 +1160,7 @@ class RecordingController:
             prior = self._prior(key, "stop")
             if prior:
                 return prior
-            state = self.store.load(enabled=self.enabled)
-            if not self.enabled:
-                return self._record(key, "stop", 409, "disabled")
+            state = self.store.load()
             if state.get("state") in {"idle"}:
                 return self._record(key, "stop", 409, "not-active")
             if state.get("state") in {"complete", "failed"}:
@@ -1181,11 +1173,11 @@ class RecordingController:
             timeout = parse_positive("RECORDING_FINALIZE_TIMEOUT", 120) + 5
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
-                current = self.store.load(enabled=True)
+                current = self.store.load()
                 if current.get("state") in {"complete", "failed"}:
                     break
                 time.sleep(0.1)
-            current = self.store.load(enabled=True)
+            current = self.store.load()
             if current.get("state") == "complete":
                 return self._record(key, "stop", 200, "complete")
             if current.get("state") == "failed":
@@ -1199,7 +1191,7 @@ class RecordingController:
 
     def final_artifact(self) -> tuple[Path, dict[str, object]] | None:
         """Return the verified final MP4 only after finalization has completed."""
-        state = self.store.load(enabled=self.enabled)
+        state = self.store.load()
         if state.get("state") != "complete" or state.get("finalizationState") != "verified":
             return None
         operation_id = str(state.get("operationId") or "")
@@ -1211,7 +1203,7 @@ class RecordingController:
     def _monitor(self) -> None:
         while not self.closed.wait(1):
             with self.lock:
-                state = self.store.load(enabled=self.enabled)
+                state = self.store.load()
                 if state.get("state") in {"requested", "active", "finalizing"}:
                     if self.process is not None and self.process.poll() is not None:
                         self.process = None
@@ -1289,7 +1281,7 @@ def synthetic_smoke(root: Path, seconds: int, segment_seconds: int) -> dict[str,
     state["stoppedAt"] = now()
     if not finalize_recording(store, state):
         raise RuntimeError("synthetic finalization failed")
-    return store.public(store.load(enabled=True))
+    return store.public(store.load())
 
 
 def main() -> None:

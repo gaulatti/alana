@@ -28,7 +28,6 @@ valid_env=(
     CROCCANTE_CONTROL_TOKEN_FILE="${token_dir}/croccante"
     PIPELINE_READY_TIMEOUT=90
     CONTROL_RETRY_SECONDS=5
-    RECORDING_ENABLED=0
     RECORDING_SEGMENT_SECONDS=5
     RECORDING_QUOTA_BYTES=53687091200
     RECORDING_MIN_FREE_BYTES=1073741824
@@ -65,17 +64,6 @@ env "${valid_env[@]}" LIVEKIT_ENABLED=1 LIVEKIT_URL=ws://livekit.test \
     LIVEKIT_API_KEY=test-key LIVEKIT_API_SECRET=test-secret LIVEKIT_ROOM=test-room \
     bash validate-config.sh | grep -q '\[config\] valid'
 
-if env "${valid_env[@]}" RECORDING_ENABLED=2 bash validate-config.sh >/dev/null 2>&1; then
-    echo "invalid recording enablement unexpectedly passed" >&2
-    exit 1
-fi
-
-env "${valid_env[@]}" ALANA_LIVE_PROFILE=on bash validate-config.sh | grep -q '\[config\] valid'
-env "${valid_env[@]}" ALANA_LIVE_PROFILE=off bash validate-config.sh | grep -q '\[config\] valid'
-if env "${valid_env[@]}" ALANA_LIVE_PROFILE=1 bash validate-config.sh >/dev/null 2>&1; then
-    echo "invalid live-profile setting unexpectedly passed" >&2
-    exit 1
-fi
 
 if env "${valid_env[@]}" RECORDING_QUOTA_BYTES=100 RECORDING_MIN_FREE_BYTES=100 \
     bash validate-config.sh >/dev/null 2>&1; then

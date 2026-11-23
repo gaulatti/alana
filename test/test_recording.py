@@ -103,7 +103,7 @@ class RecordingContractTests(unittest.TestCase):
         harvest_segments(store, stale_capture_state, include_latest=True)
 
         self.assertEqual(stale_capture_state["state"], "finalizing")
-        self.assertEqual(store.load(enabled=True)["state"], "finalizing")
+        self.assertEqual(store.load()["state"], "finalizing")
 
     def test_post_capture_manifest_corruption_persists_failed_state(self):
         store = RecordingStore(self.root)
@@ -139,7 +139,7 @@ class RecordingContractTests(unittest.TestCase):
         ):
             result = run_supervisor(self.root, operation_id)
 
-        state = store.load(enabled=True)
+        state = store.load()
         self.assertEqual(result, 1)
         self.assertEqual(state["state"], "failed")
         self.assertEqual(state["error"], "manifest-corrupt")
@@ -181,7 +181,6 @@ class RecordingContractTests(unittest.TestCase):
         store.state_file.write_text("{not-json", encoding="utf-8")
         controller = RecordingController(
             self.root,
-            enabled=True,
             ready=lambda: True,
             start_monitor=False,
         )
@@ -279,7 +278,7 @@ class RecordingContractTests(unittest.TestCase):
         try:
             with patch.dict(os.environ, environment, clear=False):
                 controller = RecordingController(
-                    self.root, enabled=True, ready=lambda: True, synthetic=True
+                    self.root, ready=lambda: True, synthetic=True
                 )
                 status, started = controller.start("recording-start")
                 self.assertEqual(status, 202)
@@ -287,7 +286,7 @@ class RecordingContractTests(unittest.TestCase):
                 deadline = time.time() + 10
                 first_pid = None
                 while time.time() < deadline:
-                    internal = controller.store.load(enabled=True)
+                    internal = controller.store.load()
                     if internal.get("workerPid") and int(internal.get("segmentCount", 0)) >= 1:
                         first_pid = int(internal["workerPid"])
                         first_segment_count = int(internal["segmentCount"])
@@ -299,7 +298,7 @@ class RecordingContractTests(unittest.TestCase):
                 deadline = time.time() + 15
                 recovered = None
                 while time.time() < deadline:
-                    recovered = controller.store.load(enabled=True)
+                    recovered = controller.store.load()
                     if (
                         int(recovered.get("restarts", 0)) >= 1
                         and recovered.get("workerPid")
@@ -345,7 +344,6 @@ class RecordingContractTests(unittest.TestCase):
             ):
                 controller = RecordingController(
                     self.root,
-                    enabled=True,
                     ready=lambda: True,
                     start_monitor=False,
                 )
@@ -362,9 +360,9 @@ class RecordingContractTests(unittest.TestCase):
 
     def test_final_artifact_requires_a_verified_complete_recording(self):
         controller = RecordingController(
-            self.root, enabled=True, ready=lambda: True, start_monitor=False
+            self.root, ready=lambda: True, start_monitor=False
         )
-        state = controller.store.load(enabled=True)
+        state = controller.store.load()
         self.assertIsNone(controller.final_artifact())
 
         operation_id = "a" * 16
@@ -386,23 +384,6 @@ class RecordingContractTests(unittest.TestCase):
         path, public = controller.final_artifact()
         self.assertEqual(path, operation_dir / "program.mp4")
         self.assertEqual(public["state"], "complete")
-
-    def test_disabled_default_has_no_recorder_process_or_side_effect(self):
-        controller = RecordingController(
-            self.root,
-            enabled=False,
-            ready=lambda: True,
-            start_monitor=False,
-        )
-        try:
-            self.assertEqual(controller.status()["state"], "disabled")
-            status, state = controller.start("disabled-start")
-            self.assertEqual(status, 409)
-            self.assertEqual(state["state"], "disabled")
-            self.assertIsNone(controller.process)
-            self.assertEqual(list(controller.store.operations_dir.iterdir()), [])
-        finally:
-            controller.close()
 
 
 if __name__ == "__main__":
@@ -512,7 +493,7 @@ class RecordingDriftTests(unittest.TestCase):
                     self.assertTrue(finalize_recording(store, state))
                 operation = store.operation_dir("0123456789abcdef")
                 self.assertTrue((operation / "program.mp4").stat().st_size > 0)
-                saved = store.load(enabled=True)
+                saved = store.load()
                 self.assertEqual((saved["state"], saved["finalizationState"], saved["finalizationMethod"]), ("complete", "verified", "fallback"))
                 self.assertEqual(json.loads((operation / "manifest.json").read_text(encoding="utf-8"))["finalizationMethod"], "fallback")
                 self.assertGreaterEqual(len(list(operation.glob("segment-*.mkv"))), 3, "every segment is kept")
@@ -527,7 +508,7 @@ class RecordingDriftTests(unittest.TestCase):
         with segment.open("ab") as handle:
             handle.write(b"\x00")
         self.assertFalse(finalize_recording(store, state))
-        self.assertEqual(store.load(enabled=True)["finalizationState"], "failed")
+        self.assertEqual(store.load()["finalizationState"], "failed")
 
     def test_measurable_segments_finalize_by_the_exact_join(self):
         from recording import finalize_recording
@@ -535,9 +516,9 @@ class RecordingDriftTests(unittest.TestCase):
         store, state = self.capture_flash_and_beep(11)
         self.assertTrue(finalize_recording(store, state))
         operation = store.operation_dir("0123456789abcdef")
-        self.assertEqual(store.load(enabled=True)["finalizationMethod"], "exact")
+        self.assertEqual(store.load()["finalizationMethod"], "exact")
         # Every segment but the last is placed by a duration; the last needs none.
-        self.assertEqual((operation / "concat.txt").read_text(encoding="utf-8").count("duration "), store.load(enabled=True)["segmentCount"] - 1)
+        self.assertEqual((operation / "concat.txt").read_text(encoding="utf-8").count("duration "), store.load()["segmentCount"] - 1)
 
 
 class SegmentAudioTimingTests(unittest.TestCase):
@@ -656,7 +637,7 @@ class FinalizeJoinTests(unittest.TestCase):
                 "packets": [{"pts_time": f"{first + index * step:.6f}"} for index in range(count)]}
 
     def saved(self):
-        return self.store.load(enabled=True)
+        return self.store.load()
 
     def test_readable_segments_join_exactly_by_their_audio(self):
         result, events = self.run_finalize(lambda name: self.packets(0.021))

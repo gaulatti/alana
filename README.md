@@ -76,7 +76,6 @@ Optional recording:
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `RECORDING_ENABLED` | `0` | Enable the private recording control contract; disabled startup creates no recorder process |
 | `RECORDING_SEGMENT_SECONDS` | `5` | Target length of each crash-tolerant Matroska segment |
 | `RECORDING_QUOTA_BYTES` | `53687091200` | Maximum retained bytes below the recording root |
 | `RECORDING_MIN_FREE_BYTES` | `1073741824` | Free-space reserve required before and during capture |
@@ -101,7 +100,6 @@ Television filler binding:
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `ALANA_LIVE_PROFILE` | `on` | `on` publishes the renderer's effective live profile and readies a filler only when Croccante acknowledges exactly that profile; `off` is the kill switch and keeps every filler path as before |
 
 ### Programme audio
 
@@ -152,7 +150,7 @@ monotonically increasing `X-Command-Sequence`:
 | `PUT` | `/v1/programs/{programId}/destinations/{version}` | While stopped, validate/reload an exact destination selection through Croccante |
 | `PUT` | `/v1/programs/{programId}/fillers/{version}` | Idempotently prepare the next-session television filler in Croccante |
 | `GET` | `/v1/programs/{programId}/fillers/{version}` | Reconcile and report Croccante's readiness for one version |
-| `GET` | `/v1/programs/{programId}/live-profile` | The renderer's effective live profile and its checksum (404 on a GPU or unqualified configuration, or with `ALANA_LIVE_PROFILE=off`) |
+| `GET` | `/v1/programs/{programId}/live-profile` | The renderer's effective live profile and its checksum (404 on a GPU or unqualified configuration) |
 | `GET` | `/v1/programs/{programId}/recording` | Current bounded recording, disk, and finalization state |
 | `POST` | `/v1/programs/{programId}/recording/start` | Start an independent recording of the already-ready composed program |
 | `POST` | `/v1/programs/{programId}/recording/stop` | Stop capture, verify every segment, and remux a final MP4 |
@@ -177,7 +175,7 @@ each). Values are never logged, forwarded, or persisted.
 
 | Boundary | What is ignored | `kind` |
 | --- | --- | --- |
-| `filler_profile` | Extra fields in Croccante's prepared profile, and (unless `ALANA_LIVE_PROFILE=off`) in the requested profile; the nine known fields must still be present and valid | `unknown_field` |
+| `filler_profile` | Extra fields in Croccante's prepared profile and in the requested profile; the nine known fields must still be present and valid | `unknown_field` |
 | `filler_status` | A Croccante filler status other than `ready`, `failed`, `unprepared`, or `preparing`; Alana reports it as `status: "unknown"`, `ready: false` (not ready, not failed) | `unknown_value` |
 | `destinations_start` | Extra fields on the Start selection or on a destination item | `unknown_field` |
 | `destinations_reload` | Extra fields on the reload body or on a destination item | `unknown_field` |
@@ -191,12 +189,12 @@ the reload path version matching the body version, and `commandId` matching the
 Recording Start/Stop uses the same bearer credential and a bounded
 `Idempotency-Key`, but no command sequence; a body is ignored and counted. Start returns `202` after
 the independent recorder reaches Requested or Active. It fails closed when the
-shared publication pipeline is not ready, recording is disabled, or the disk
+shared publication pipeline is not ready or the disk
 preflight fails. Recording health never changes publication lifecycle state.
 
 ## Private taping
 
-With the recorder enabled (`RECORDING_ENABLED=1`), `POST .../tape/start` launches the same browser and audio
+`POST .../tape/start` launches the same browser and audio
 pipeline with `TAPE_MODE=1`: no RTMP publishers, no LiveKit, no filler, and no
 Croccante call, so nothing reaches a public destination. It then starts the
 composed-program recorder. `POST .../tape/stop` stops capture, finalizes and
@@ -219,8 +217,11 @@ When enabled and explicitly started, the recorder consumes the same X11 display
 and PulseAudio `stream_out.monitor` source as every publisher. It does not
 record an RTMP or LiveKit destination, and it never sees destination URLs or
 credentials. Its public state progresses through `requested`, `active`,
-`finalizing`, `complete`, or `failed`; an enabled runtime with no operation is
-`idle`, and the default configuration reports `disabled`.
+`finalizing`, `complete`, or `failed`; a runtime with no operation is `idle`. Recording is
+always available: the status keeps an `enabled` field that is always `true`, because
+Alcantara's recording panel reads it. Nothing records until a Start or tape Start
+command, and the disk bounds (`RECORDING_QUOTA_BYTES`, `RECORDING_MIN_FREE_BYTES`,
+`RECORDING_RETENTION_HOURS`) are the only limit on what a recording may use.
 
 Recording data lives below `/var/lib/alana/recordings`, which is already part
 of the persistent `alana_state` volume:
@@ -335,7 +336,7 @@ status is reported as `unknown` and not ready.
 
 ### Filler bound to the effective live profile
 
-By default (`ALANA_LIVE_PROFILE=on`; `off` is the kill switch), Alana publishes the profile its
+Alana always publishes the profile its
 own RTMP encoder runs with, and a filler becomes ready only against it. The
 machine contract is pinned on gaulatti/alcantara#126; Alcantara reads this
 profile and sends it back unchanged in the `PUT`.
@@ -395,12 +396,10 @@ With the setting on:
 Compatibility: Croccante's existing prepare and status acknowledgement already
 returns the nine profile values, so no Croccante change is needed; a Croccante
 that omits them leaves every filler unready (fail closed). An Alcantara without
-gaulatti/alcantara#126 never reads the profile, and with the setting off this
-Alana answers 404, which that Alcantara reports as "television live profile
-unavailable". On a GPU rig the default is also 404 (Alcantara answers 503), so
-nothing changes there until a GPU encoder is qualified. Kill switch: set
-`ALANA_LIVE_PROFILE=off` and restart; responses lose `profileChecksum`, and
-Alcantara's Start binding returns to its pre-#29 behaviour.
+gaulatti/alcantara#126 never reads the profile and is unaffected by it. On a GPU rig
+the profile is 404 (Alcantara answers 503 "television live profile unavailable"), so
+no filler can become ready there until a GPU encoder is qualified. There is no
+switch: the binding is always on.
 
 Start fails closed until a pending version is ready. Alana passes that exact
 version to Croccante with `X-Filler-Version` and reports Running only when
@@ -578,8 +577,8 @@ RTMP legs are aggregated into configured, healthy, and progressing counts.
 | `alana_lifecycle_commands_total` | Start/Stop command outcomes | `action`, `result` |
 | `alana_reconcile_cycles_total` | Reconciliation success/failure | `result` |
 | `alana_filler_preparations_total` | Preparation, duplicate, conflict, retry, and reconciliation outcomes | `result` |
-| `alana_filler_profile_bindings_total` | Filler readiness checks against the live profile (unless `ALANA_LIVE_PROFILE=off`) | `operation` (`prepare`, `status`, `reconcile`, `start`), `result` (`bound`, `caller_mismatch`, `profile_mismatch`, `source_mismatch`, `unavailable`) |
-| `alana_live_profile_state` | One-hot live-profile publication | `state` (`off`, `published`, `unqualified`) |
+| `alana_filler_profile_bindings_total` | Filler readiness checks against the live profile | `operation` (`prepare`, `status`, `reconcile`, `start`), `result` (`bound`, `caller_mismatch`, `profile_mismatch`, `source_mismatch`, `unavailable`) |
+| `alana_live_profile_state` | One-hot live-profile publication | `state` (`published`, `unqualified`) |
 | `alana_destination_operations_total` | Destination reload validation outcomes | `action`, `result` |
 | `alana_recording_commands_total` | Recording Start/Stop outcomes | `action`, `result` |
 | `alana_unrecognized_input_total` | Inputs ignored because Alana does not recognize them | `boundary` (`filler_profile`, `filler_status`, `destinations_start`, `destinations_reload`, `command_body`), `kind` (`unknown_field`, `unknown_value`, `unexpected_body`) |
@@ -596,7 +595,6 @@ RTMP legs are aggregated into configured, healthy, and progressing counts.
 | `alana_rtmp_outputs_progressing` | RTMP legs reporting frame progress | none |
 | `alana_livekit_enabled` | LiveKit configuration state | none |
 | `alana_livekit_healthy` | LiveKit runtime health | none |
-| `alana_recording_enabled` | Whether recording control is enabled | none |
 | `alana_recording_state` | One-hot bounded recording lifecycle | `state` |
 | `alana_recording_segments` / `alana_recording_bytes` / `alana_recording_duration_seconds` | Current durable recording size and duration | none |
 | `alana_recording_dropped_frames` / `alana_recording_errors_total` / `alana_recording_restarts_total` | Current operation capture counters | none |
