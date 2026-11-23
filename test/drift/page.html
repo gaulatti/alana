@@ -1,0 +1,28 @@
+<!doctype html>
+<!-- Drift rig program (gaulatti/alana#32): a white flash and a 1 kHz beep, 300 ms each, every
+     10 s. Both are timed from the page's audio clock, so a recording that keeps its audio and
+     video on one clock shows a constant offset between them, and any drift is the pipeline's. -->
+<html><head><meta charset="utf-8"><title>drift</title>
+<style>html,body{margin:0;height:100%;background:#000;overflow:hidden}#f{position:fixed;inset:0;background:#fff;display:none}</style>
+</head><body><div id="f"></div><script>
+const PERIOD = 10, LENGTH = 0.3;
+const context = new AudioContext();
+const flash = document.getElementById('f');
+let next = null;
+function schedule(at) {
+  const tone = context.createOscillator(), gain = context.createGain();
+  tone.frequency.value = 1000; gain.gain.value = 0.5;
+  tone.connect(gain).connect(context.destination);
+  tone.start(at); tone.stop(at + LENGTH);
+}
+function frame() {
+  const now = context.currentTime;
+  if (next === null && context.state === 'running') { next = Math.ceil(now + 1); schedule(next); }
+  if (next !== null) {
+    flash.style.display = now >= next && now < next + LENGTH ? 'block' : 'none';
+    if (now >= next + LENGTH) { next += PERIOD; schedule(next); }
+  }
+  requestAnimationFrame(frame);
+}
+context.resume().finally(() => requestAnimationFrame(frame));
+</script></body></html>

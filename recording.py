@@ -680,13 +680,23 @@ def terminate_process(process: subprocess.Popen[bytes], timeout: int = 15) -> No
         process.wait(timeout=5)
 
 
-def segment_video_span(path: Path) -> float:
-    """Seconds from a segment's first video frame to the end of its last one.
+# The recorder encodes AAC-LC (`-c:a aac`): every packet carries exactly this many samples.
+AAC_FRAME_SAMPLES = 1024
 
-    Segments are cut on video keyframes, so consecutive spans tile the
-    recording exactly. The container duration also counts the AAC frame that
-    overhangs each cut (up to 21 ms); concatenating by it delayed the video of
-    every later segment, so audio drifted ahead by about 1.5 ms per second.
+
+def segment_audio_timing(path: Path) -> tuple[float, float]:
+    """Where a segment's audio starts and how long it is, by sample count (s).
+
+    The start is the first audio timestamp less the file's own start time: the
+    concat demuxer removes that before placing the file, and it is not zero in a
+    segment that opens with encoder priming or with video ahead of audio.
+
+    The capture's audio is one continuous run of samples, and it is played that
+    way whatever its timestamps say. Placing segments by their video let each
+    segment's audio overlap the next one's start; every overlapped sample still
+    played, so audio landed later and later (about +16 ms per minute on a quiet
+    machine, against -0.4 placed by sample count). Counting samples also avoids
+    Matroska's millisecond rounding of timestamps and packet durations.
     """
     result = subprocess.run(
         [
@@ -694,9 +704,9 @@ def segment_video_span(path: Path) -> float:
             "-v",
             "error",
             "-select_streams",
-            "v:0",
+            "a:0",
             "-show_entries",
-            "packet=pts_time,duration_time",
+            "format=start_time:stream=codec_name,sample_rate:packet=pts_time",
             "-of",
             "json",
             str(path),
@@ -707,18 +717,38 @@ def segment_video_span(path: Path) -> float:
         timeout=30,
     )
     payload = json.loads(result.stdout)
-    packets = payload.get("packets") if isinstance(payload, dict) else None
-    if not isinstance(packets, list) or not packets:
-        raise ValueError("segment has no video")
+    if not isinstance(payload, dict):
+        raise ValueError("segment audio timing is unreadable")
+    streams, packets, media_format = payload.get("streams"), payload.get("packets"), payload.get("format")
+    if not isinstance(streams, list) or not streams or not isinstance(packets, list) or not packets:
+        raise ValueError("segment has no audio")
     try:
-        starts = [float(packet["pts_time"]) for packet in packets]
-        last = max(range(len(packets)), key=lambda index: starts[index])
-        span = starts[last] + float(packets[last]["duration_time"]) - min(starts)
+        if streams[0]["codec_name"] != "aac":
+            raise ValueError("segment audio is not AAC")
+        rate = int(streams[0]["sample_rate"])
+        first = min(float(packet["pts_time"]) for packet in packets) - float(media_format["start_time"])
     except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError("segment video timing is unreadable") from exc
-    if not math.isfinite(span) or span <= 0:
-        raise ValueError("segment video span is invalid")
-    return span
+        raise ValueError("segment audio timing is unreadable") from exc
+    if rate <= 0 or not math.isfinite(first):
+        raise ValueError("segment audio timing is invalid")
+    return first, len(packets) * AAC_FRAME_SAMPLES / rate
+
+
+def audio_anchored_durations(timings: list[tuple[float, float]]) -> list[float]:
+    """Concat durations that start each segment where the previous one's audio ends.
+
+    A segment placed at offset O starts its audio at O + first; the next segment
+    must start its audio at O + first + length, so it is placed at
+    O + first + length - next_first. The positions telescope, so rounding in one
+    segment's first timestamp never accumulates. The last segment needs none.
+    """
+    durations = []
+    for (first, length), (next_first, _) in zip(timings, timings[1:]):
+        duration = first + length - next_first
+        if not math.isfinite(duration) or duration <= 0:
+            raise ValueError("segment audio does not continue")
+        durations.append(duration)
+    return durations
 
 
 def finalize_recording(store: RecordingStore, state: dict[str, object]) -> bool:
@@ -737,12 +767,12 @@ def finalize_recording(store: RecordingStore, state: dict[str, object]) -> bool:
             if sha256_file(segment) != record.get("sha256"):
                 raise ValueError("segment checksum mismatch")
             segments.append(segment)
-        # Exact: each segment starts where the previous one's video ended. A
-        # recording is never refused for this: if any segment's span cannot be
-        # measured, join by container duration as before (#32), which drifts
-        # slowly but keeps every segment.
+        # Exact: each segment starts where the previous one's audio ended, by
+        # sample count (#32). A recording is never refused for this: if any
+        # segment's audio cannot be measured, join by container duration as
+        # before, which drifts but keeps every segment.
         try:
-            spans: list[float] | None = [segment_video_span(segment) for segment in segments]
+            spans: list[float] | None = audio_anchored_durations([segment_audio_timing(segment) for segment in segments])
             state["finalizationMethod"] = "exact"
         except (OSError, ValueError, subprocess.SubprocessError, json.JSONDecodeError):
             spans = None
@@ -751,7 +781,7 @@ def finalize_recording(store: RecordingStore, state: dict[str, object]) -> bool:
         with concat_path.open("w", encoding="utf-8") as output:
             for index, segment in enumerate(segments):
                 output.write(f"file '{segment.name}'\n")
-                if spans is not None:
+                if spans is not None and index < len(spans):
                     output.write(f"duration {spans[index]:.6f}\n")
             output.flush()
             os.fsync(output.fileno())
