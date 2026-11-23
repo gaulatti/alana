@@ -2142,6 +2142,9 @@ class Handler(BaseHTTPRequestHandler):
                         400, {"error": "a bounded Idempotency-Key is required"}
                     )
                     return
+                if length < 0:
+                    self.send_json(400, {"error": "a valid Content-Length is required"})
+                    return
                 if length != 0:
                     self.discard_unexpected_body(length)
                 status, payload = tape().command(path.rsplit("/", 1)[1], key)
